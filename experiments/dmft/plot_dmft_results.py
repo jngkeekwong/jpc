@@ -731,6 +731,101 @@ def plot_grad_cosine_similarities(
     return save_path
 
 
+def plot_pc_kernel_width_alignment(
+    align_df,
+    plots_dir,
+    gamma_0=None,
+    n_hidden=None,
+    activity_lr=None,
+    n_infer_iters=None,
+):
+    """Plot finite-vs-theory kernel alignment vs width for every layer.
+
+    ``align_df`` must have columns ``width``, ``layer``, ``kernel``
+    (``"h"`` or ``"delta"``), ``alignment``, and optionally ``seed``.
+    Mean ± std over seeds is shown when multiple trials are present.
+    Compares last-training-time hidden-layer kernels (``C^h`` at ``k=0``,
+    ``C^Δ`` at the last inference step ``k=K``) for all ``H`` hidden layers
+    (readout omitted).
+    """
+    plots_dir = _pc_loss_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+    )
+    if align_df is None or len(align_df) == 0:
+        print("No kernel-alignment records to plot.")
+        return []
+
+    specs = (
+        (
+            "h",
+            r"$A(C^{h,\ell}_{\mathrm{DMFT}}, C^{h,\ell}_{\mathrm{NN}})$",
+            "pc_kernel_alignment_Ch_vs_width.png",
+        ),
+        (
+            "delta",
+            r"$A(C^{\Delta,\ell}_{\mathrm{DMFT}}, C^{\Delta,\ell}_{\mathrm{NN}})$",
+            "pc_kernel_alignment_Cdelta_vs_width.png",
+        ),
+    )
+    saved = []
+    for kernel_id, ylabel, filename in specs:
+        sub = align_df[align_df["kernel"] == kernel_id]
+        if sub.empty:
+            continue
+
+        plt.figure(figsize=(8, 5))
+        layers = sorted(sub["layer"].unique())
+        for layer in layers:
+            sl = sub[sub["layer"] == layer]
+            widths = sorted(sl["width"].unique())
+            means = []
+            stds = []
+            for width in widths:
+                vals = sl.loc[sl["width"] == width, "alignment"].to_numpy(
+                    dtype=float
+                )
+                means.append(np.mean(vals))
+                stds.append(np.std(vals, ddof=0))
+            means = np.asarray(means)
+            stds = np.asarray(stds)
+            _warn_if_nonfinite(
+                f"kernel alignment {kernel_id} layer={int(layer)}", means
+            )
+            plt.errorbar(
+                widths,
+                means,
+                stds,
+                marker="o",
+                label=rf"$\ell = {int(layer) + 1}$",
+            )
+        plt.xscale("log")
+        plt.xlabel(r"$N$", fontsize=20)
+        plt.ylabel(ylabel, fontsize=20)
+        title = "PC kernel alignment vs width"
+        if n_hidden is not None:
+            title += f", $H={int(n_hidden)}$"
+        if gamma_0 is not None:
+            title += f", $\\gamma_0={gamma_0}$"
+        if activity_lr is not None:
+            title += f", activity lr$={activity_lr}$"
+        if n_infer_iters is not None:
+            title += f", $K={n_infer_iters}$"
+        plt.title(title)
+        plt.legend()
+        plt.grid(True, alpha=0.4)
+        plt.tight_layout()
+        save_path = os.path.join(plots_dir, filename)
+        plt.savefig(save_path, bbox_inches="tight")
+        plt.close()
+        print(f"PC kernel alignment plot saved to {save_path}")
+        saved.append(save_path)
+    return saved
+
+
 def load_and_plot(results_dir, gamma_0, plots_dir=None, n_hidden=None):
     """Load saved DMFT results from results_dir and generate plots."""
     suffix = f"{gamma_0}_gamma_0"

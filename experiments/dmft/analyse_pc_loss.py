@@ -3,7 +3,11 @@
 Runs PC DMFT theory and finite-width PC simulations (iterative inference,
 plus closed-form equilibrium updates for linear nets). Backpropagation
 theory, finite BP simulations, and PC–BP gradient cosine similarities
-are omitted.
+are omitted. Plots PC training loss across depth (``n_hiddens``), gamma
+(``gamma_0s``) and inference steps (``n_infer_iters``).
+
+For finite-width vs theory kernel alignment plots against width, see
+``analyse_convergence.py`` instead.
 
 Use the ``PC_dmft_env`` conda environment:
     /data/ndcn-computational-neuroscience/mert5001/envs/PC_dmft_env/bin/python analyse_pc_loss.py
@@ -33,7 +37,7 @@ from experiments.dmft.utils import (
     train_pcn,
 )
 from theory_pc_utils import solve_pc_kernels
-from theory_pc_nonlin_utils import solve_pc_kernels_nonlin
+from theory_pc_nonlin_utils import solve_pc_kernels_nonlin, get_nonlinearity
 from plot_dmft_results import (
     plot_pc_theory_vs_finite_loss,
     plot_pc_param_sweep_loss,
@@ -94,7 +98,7 @@ def _train_finite_pc(
         use_bias=False,
         param_type=param_type,
     )
-    train_pcn(
+    _, model, skip_model = train_pcn(
         model=model,
         use_skips=use_skips,
         X_input=X_input,
@@ -112,7 +116,8 @@ def _train_finite_pc(
         store_grads=False,
         loss_id=loss_id,
     )
-    return np.load(f"{save_dir}/train_losses.npy")
+    losses = np.load(f"{save_dir}/train_losses.npy")
+    return losses
 
 
 def _loss_records(losses, **meta):
@@ -258,7 +263,8 @@ if __name__ == "__main__":
         overlay_n_hiddens or overlay_gamma_0s or overlay_n_infer_iters
     )
     max_width = max(args.widths)
-    run_widths = [max_width] if overlay_any else list(args.widths)
+    run_widths = list(args.widths) if not overlay_any else [max_width]
+    phi_fn, _ = get_nonlinearity(args.act_fn, beta=args.nonlin_beta)
 
     for seed in range(args.seed, args.seed + args.n_seeds):
         print(f"\nRunning experiment for seed: {seed}")
@@ -653,26 +659,23 @@ if __name__ == "__main__":
 ###########################
 
 # Across depth
-# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 20 --n_hiddens 3 4 5 6  --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 20 --n_hiddens 2 3 4 5  --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
 
 # Across gamma
-# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 20 --n_hiddens 6 --widths 4096 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 20 --n_hiddens 5 --widths 4096 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
 
 # Across K
-# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 20 --n_hiddens 6 --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 10 15 20 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --skip_theory
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 20 --n_hiddens 5 --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 10 15 20 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --skip_theory
 
 
 ############ NONLINEAR ##################
 #########################################
 
 # Across depth
-# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 2 3 4  --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 1 2 3  --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
 
 # Across gamma
-# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 4 --widths 4096 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 3 --widths 4096 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
 
 # Across K
-# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 4 --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 10 15 20 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000 --skip_theory
-
-
-
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 3 --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 10 15 20 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000 --skip_theory

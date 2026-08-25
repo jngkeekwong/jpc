@@ -114,6 +114,155 @@ def cosine_similarity(a, b, axis=None, eps=1e-8):
     return num / denom
 
 
+def pc_hidden_preactivations_and_errors(
+    model,
+    skip_model,
+    activities,
+    x,
+    param_type,
+    gamma,
+):
+    """Hidden pre-activations ``h`` and PC prediction errors ``Δ``.
+
+    ``jpc.make_mlp`` stores pre-activations: layer ``ℓ`` maps
+    ``h^ℓ = a_ℓ W_ℓ φ(h^{ℓ-1})``. Hidden errors are the energy residuals
+    ``Δ^ℓ = h^ℓ - f_ℓ(h^{ℓ-1})``, which vanish on the feedforward init
+    (``k = 0``), matching the DMFT boundary ``Δ_0 = 0``.
+    """
+    scalings = jpc._get_param_scalings(
+        model=model,
+        input=x,
+        skip_model=skip_model,
+        param_type=param_type,
+        gamma=gamma,
+    )
+    n_hidden = len(model) - 1
+    if skip_model is None:
+        skip_model = [None] * len(model)
+
+    hs = []
+    deltas = []
+    for l in range(n_hidden):
+        h = activities[l]
+        prev = x if l == 0 else activities[l - 1]
+        pred = scalings[l] * jax.vmap(model[l])(prev)
+        if skip_model[l] is not None:
+            pred = pred + jax.vmap(skip_model[l])(prev)
+        hs.append(h)
+        deltas.append(h - pred)
+    return hs, deltas
+
+
+def empirical_pc_kernel(field):
+    """Finite-width PC kernel from a field with trailing neuron axis ``N``.
+
+    All leading axes are flattened (slowest-first), matching the DMFT
+    ``(k, t, mu)`` convention when those axes are present.
+    """
+    arr = np.asarray(field, dtype=np.float64)
+    if arr.ndim < 2:
+        raise ValueError(f"expected at least (..., N), got shape {arr.shape}")
+    n_units = arr.shape[-1]
+    if n_units < 1:
+        raise ValueError("width N must be positive")
+    flat = arr.reshape(-1, n_units)
+    return (flat @ flat.T) / n_units
+
+
+def final_time_pc_kernel(
+    cov, num_inference_steps, num_training_steps, num_samples, k=0
+):
+    """Sample-sample kernel at inference step ``k`` and the last training time."""
+    K1 = num_inference_steps + 1
+    if not (0 <= k < K1):
+        raise ValueError(
+            f"k={k} is out of range for K={num_inference_steps} "
+            f"(valid 0,...,{num_inference_steps})."
+        )
+    T = num_training_steps
+    P = num_samples
+    tensor = np.asarray(cov, dtype=np.float64).reshape(K1, T, P, K1, T, P)
+    return tensor[k, -1, :, k, -1, :]
+
+
+def collect_final_pc_kernel_fields(
+    model,
+    skip_model,
+    X_input,
+    Y_target,
+    width,
+    param_type,
+    gamma_0,
+    activity_lr,
+    loss_id,
+    n_infer_iters,
+):
+    """Hidden ``h`` at ``k=0`` (feedforward) and ``Δ`` at ``k=n_infer_iters``.
+
+    Runs ``n_infer_iters`` steps of iterative inference (mirroring the
+    inference loop in ``train_pcn``) so ``Δ`` is taken at the same final
+    inference step ``k=K`` used by the PC DMFT theory and finite-size
+    training, rather than after a single step.
+
+    Returns arrays of shape ``(n_hidden, P, N)``.
+    """
+    depth = len(model)
+    output_energy_scaling = get_output_energy_scaling(
+        param_type, gamma_0, width, depth
+    )
+    hidden_energy_scaling = get_hidden_energy_scaling(param_type, depth)
+    batch_size = X_input.shape[0]
+    activity_optim = optax.sgd(activity_lr * batch_size)
+
+    activities = jpc.init_activities_with_ffwd(
+        model=model,
+        input=X_input,
+        skip_model=skip_model,
+        param_type=param_type,
+        gamma=gamma_0,
+    )
+    hs, _ = pc_hidden_preactivations_and_errors(
+        model=model,
+        skip_model=skip_model,
+        activities=activities,
+        x=X_input,
+        param_type=param_type,
+        gamma=gamma_0,
+    )
+
+    activity_opt_state = activity_optim.init(activities)
+    for _ in range(n_infer_iters):
+        activity_update_result = jpc.update_pc_activities(
+            params=(model, skip_model),
+            activities=activities,
+            optim=activity_optim,
+            opt_state=activity_opt_state,
+            output=Y_target,
+            input=X_input,
+            param_type=param_type,
+            gamma=gamma_0,
+            loss_id=loss_id,
+            output_energy_scaling=output_energy_scaling,
+            hidden_energy_scaling=hidden_energy_scaling,
+        )
+        activities = activity_update_result["activities"]
+        activity_opt_state = activity_update_result["opt_state"]
+    _, deltas = pc_hidden_preactivations_and_errors(
+        model=model,
+        skip_model=skip_model,
+        activities=activities,
+        x=X_input,
+        param_type=param_type,
+        gamma=gamma_0,
+    )
+    return {
+        "h": np.stack([np.asarray(h, dtype=np.float32) for h in hs], axis=0),
+        "delta": np.stack(
+            [np.asarray(d, dtype=np.float32) for d in deltas], axis=0
+        ),
+    }
+
+
 class MLP(LimitsMLP):
     def __init__(
             self,
@@ -205,6 +354,10 @@ def train_pcn(
     ``output_energy_scaling = gamma^2 * width * depth`` and
     ``hidden_energy_scaling = depth`` for µPC (rather than baking the
     width/depth factor into the optimiser learning rate).
+    Note that depth includes the output layer here, as opposed to depth in theory_utils.py
+
+    Returns ``(pc_grads, model, skip_model)``. ``pc_grads`` is ``None``
+    unless ``store_grads`` is True.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -336,7 +489,7 @@ def train_pcn(
     np.save(f"{save_dir}/train_losses.npy", np.array(train_losses))
     np.save(f"{save_dir}/loss_rescalings.npy", loss_rescalings)
 
-    return pc_grads
+    return pc_grads, model, skip_model
 
 
 def train_bpn(

@@ -590,7 +590,7 @@ if __name__ == "__main__":
                                             "don't match!\n"
                                         )
 
-                                pc_grads = train_pcn(
+                                pc_grads, _, _ = train_pcn(
                                     model=pc_model,
                                     use_skips=use_skips,
                                     X_input=X_input,
