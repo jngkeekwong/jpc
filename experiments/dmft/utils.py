@@ -16,6 +16,7 @@ import numpy as np
 import optax
 
 import jpc
+from experiments.datasets import CIFAR10
 from experiments.limits_paper.utils import MLP as LimitsMLP
 from experiments.limits_paper.utils import configure_param_optim, flatten_grads
 
@@ -26,36 +27,90 @@ def create_toy_dataset(key, D, P):
     return X, y
 
 
-def cosine_similarity(a, b, axis=None, eps=1e-8):
-    """
-    Computes cosine similarity between two vectors/matrices/kernels.
+CIFAR_GRAY_DIM = 32 * 32
+
+
+def create_tiny_cifar10_dataset(key, D, P, class0=0, class1=1):
+    """Subsample a binary grayscale CIFAR-10 dataset.
+
+    Loads CIFAR-10 via ``experiments.datasets.CIFAR10``, converts RGB
+    images to grayscale, and draws ``P // 2`` examples from each of two
+    classes. Labels are mapped to ``{-1, +1}``.
 
     Args:
-        a: jnp.ndarray, input array (vector, matrix, or kernel).
-        b: jnp.ndarray, same shape as a.
-        axis: Axis or axes along which to compute similarity. 
-            If None, uses the last axis for vectors and (0, 1) for 2D matrices/kernels (unless a/b are 1D).
-        eps: Small epsilon to prevent division by zero.
+        key: JAX PRNG key for sampling indices.
+        D: Input dimension; must be ``32 * 32`` (flattened grayscale).
+        P: Number of samples (must be even).
+        class0: CIFAR-10 class mapped to ``-1`` (default: airplane).
+        class1: CIFAR-10 class mapped to ``+1`` (default: automobile).
 
     Returns:
-        Cosine similarity as a float or array, depending on axis.
-        Values are in the range [-1, 1].
+        X: array of shape ``(D, P)``.
+        y: array of shape ``(P,)``.
     """
-    # Flatten for 1D vectors
-    if a.ndim == 1 or b.ndim == 1:
-        num = jnp.dot(a, b)
-        denom = jnp.linalg.norm(a) * jnp.linalg.norm(b) + eps
-        return num / denom
+    if D != CIFAR_GRAY_DIM:
+        raise ValueError(
+            f"Grayscale CIFAR-10 has dimension {CIFAR_GRAY_DIM}, got D={D}."
+        )
+    if P % 2 != 0:
+        raise ValueError(f"P must be even so classes are balanced, got P={P}.")
 
-    # Default to last axis (for batches of vectors), or (0,1) for 2D kernels
-    if axis is None:
-        axis = -1 if a.ndim == 2 else (0, 1) if a.ndim == 2 else None
-
-    # Compute numerator and denominator
-    num = jnp.sum(a * b, axis=axis)
-    denom = (
-        jnp.linalg.norm(a, axis=axis) * jnp.linalg.norm(b, axis=axis) + eps
+    dataset = CIFAR10(
+        train=True,
+        normalise=False,
+        flatten=False,
+        save_dir=str(Path(__file__).resolve().parent / "datasets" / "cifar10"),
     )
+    X_rgb = np.asarray(dataset.data, dtype=np.float32) / 255.0
+    labels = np.asarray(dataset.targets)
+
+    # ITU-R BT.601 luma, matching the usual CIFAR grayscale conversion.
+    X_gray = (
+        0.2989 * X_rgb[..., 0]
+        + 0.5870 * X_rgb[..., 1]
+        + 0.1140 * X_rgb[..., 2]
+    )
+
+    inds0 = np.where(labels == class0)[0]
+    inds1 = np.where(labels == class1)[0]
+    n = P // 2
+    if n > len(inds0) or n > len(inds1):
+        raise ValueError(
+            f"Requested {n} samples per class but class {class0} has "
+            f"{len(inds0)} and class {class1} has {len(inds1)}."
+        )
+
+    key0, key1 = jr.split(key)
+    idx0 = inds0[np.asarray(jr.choice(key0, len(inds0), (n,), replace=False))]
+    idx1 = inds1[np.asarray(jr.choice(key1, len(inds1), (n,), replace=False))]
+
+    X = np.concatenate([X_gray[idx0], X_gray[idx1]], axis=0).reshape(P, D).T
+    y = np.concatenate([np.full(n, -1.0), np.full(n, 1.0)])
+    return jnp.asarray(X), jnp.asarray(y)
+
+
+def cosine_similarity(a, b, axis=None, eps=1e-8):
+    """Cosine similarity between two arrays, or pairwise over sequences.
+
+    ``axis=None`` flattens both arrays (Frobenius / vector cosine sim).
+    Pass ``axis=-1`` for a batch of vectors. Lists/tuples are compared
+    pairwise, e.g. PC and BP grads over training steps.
+    """
+    if isinstance(a, (list, tuple)):
+        return jnp.array([
+            cosine_similarity(x, y, axis=axis, eps=eps)
+            for x, y in zip(a, b)
+        ])
+
+    a, b = jnp.asarray(a), jnp.asarray(b)
+    if axis is None:
+        a, b = a.reshape(-1), b.reshape(-1)
+        n = min(a.shape[0], b.shape[0])
+        a, b = a[:n], b[:n]
+        axis = 0
+
+    num = jnp.sum(a * b, axis=axis)
+    denom = jnp.linalg.norm(a, axis=axis) * jnp.linalg.norm(b, axis=axis) + eps
     return num / denom
 
 

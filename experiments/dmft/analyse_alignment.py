@@ -21,6 +21,8 @@ from experiments.datasets import get_dataloaders
 from experiments.mupc_paper.utils import set_seed
 from experiments.limits_paper.utils import setup_pc_experiment
 from experiments.dmft.utils import (
+    CIFAR_GRAY_DIM,
+    create_tiny_cifar10_dataset,
     create_toy_dataset,
     cleanup_experiment_dirs,
     train_pcn,
@@ -122,7 +124,7 @@ if __name__ == "__main__":
     parser.add_argument("--results_dir", type=str, default="results")
 
     # Dataset parameters
-    parser.add_argument("--dataset", type=str, default="toy", choices=["toy", "Fashion-MNIST", "CIFAR10"])
+    parser.add_argument("--dataset", type=str, default="toy", choices=["toy", "tiny-CIFAR10", "Fashion-MNIST", "CIFAR10"])
     parser.add_argument("--input_dim", type=int, default=20) # 40)
     parser.add_argument("--n_samples", type=int, default=5) # 20)
 
@@ -265,6 +267,13 @@ if __name__ == "__main__":
             )
             input_dim = args.input_dim
             output_dim = 1
+        elif args.dataset == "tiny-CIFAR10":
+            input_dim = CIFAR_GRAY_DIM
+            X, y = create_tiny_cifar10_dataset(
+                key=data_key, D=input_dim, P=args.n_samples
+            )
+            output_dim = 1
+            print(f"Input dim: {input_dim}, Output dim: {output_dim}")
         else:
             train_loader, _ = get_dataloaders(args.dataset, args.n_samples)
             img_batch, label_batch = next(iter(train_loader))
@@ -282,7 +291,9 @@ if __name__ == "__main__":
         # the convention assumed by the (whole-batch) DMFT theory.
         X_input = X.T  # Shape (P, D)
         Y_target = y[:, None] if y.ndim == 1 else y
-        loss_id = "mse" if args.dataset == "toy" else args.loss_id
+        loss_id = (
+            "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
+        )
 
         for n_hidden in args.n_hiddens:
             print(f"\n\tn hidden H = {n_hidden}")
