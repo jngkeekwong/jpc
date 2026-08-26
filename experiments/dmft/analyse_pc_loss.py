@@ -37,7 +37,7 @@ from experiments.dmft.utils import (
     train_pcn,
 )
 from theory_pc_utils import solve_pc_kernels
-from theory_pc_nonlin_utils import solve_pc_kernels_nonlin, get_nonlinearity
+from theory_pc_nonlin_utils import solve_pc_kernels_nonlin
 from plot_dmft_results import (
     plot_pc_theory_vs_finite_loss,
     plot_pc_param_sweep_loss,
@@ -264,7 +264,6 @@ if __name__ == "__main__":
     )
     max_width = max(args.widths)
     run_widths = list(args.widths) if not overlay_any else [max_width]
-    phi_fn, _ = get_nonlinearity(args.act_fn, beta=args.nonlin_beta)
 
     for seed in range(args.seed, args.seed + args.n_seeds):
         print(f"\nRunning experiment for seed: {seed}")

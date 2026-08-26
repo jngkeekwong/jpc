@@ -28,8 +28,8 @@ from experiments.datasets import get_dataloaders
 from experiments.mupc_paper.utils import set_seed
 from experiments.limits_paper.utils import setup_pc_experiment
 from experiments.dmft.utils import (
-    # CIFAR_GRAY_DIM,
-    # create_tiny_cifar10_dataset,
+    CIFAR_GRAY_DIM,
+    create_tiny_cifar10_dataset,
     create_toy_dataset,
     cleanup_experiment_dirs,
     train_pcn,
@@ -190,6 +190,7 @@ def _kernel_align_records(
                     cosine_similarity(
                         final_time_pc_kernel(all_Ch[l], k=0, **slice_kw),
                         C_h_ex,
+                        eps=1e-30,
                     )
                 ),
             }
@@ -205,6 +206,7 @@ def _kernel_align_records(
                             all_Cdelta[l], k=num_inference_steps, **slice_kw
                         ),
                         C_delta_ex,
+                        eps=1e-30,
                     )
                 ),
             }
@@ -607,11 +609,11 @@ if __name__ == "__main__":
 ###########################
 
 # Kernel alignment vs width
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 128 512 2048 8192 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --n_seeds 3
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10 25 100 250 1000 2500 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 400 --pc_damping 0.1 --pc_tolerance 1e-10 --n_seeds 3
 
 
 ############ NONLINEAR ##################
 #########################################
 
 # Kernel alignment vs width
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 10 --n_hiddens 3 --widths 128 512 2048 8192 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000 --n_seeds 3
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 10 --n_hiddens 3 --widths 10 25 100 250 1000 2500 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 400 --pc_damping 0.1 --act_fn tanh --num_mc_samples 1000 --n_seeds 3
