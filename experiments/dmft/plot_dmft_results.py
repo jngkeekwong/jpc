@@ -826,6 +826,302 @@ def plot_pc_kernel_width_alignment(
     return saved
 
 
+def _alignment_plots_dir(
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+):
+    if n_hidden is not None:
+        plots_dir = os.path.join(plots_dir, f"{n_hidden}_n_hidden")
+    if gamma_0 is not None:
+        plots_dir = os.path.join(plots_dir, f"gamma_{gamma_0}")
+    if activity_lr is not None:
+        plots_dir = os.path.join(plots_dir, f"activity_lr_{activity_lr}")
+    if n_infer_iters is not None:
+        plots_dir = os.path.join(plots_dir, f"{n_infer_iters}_n_infer_iters")
+    plots_dir = os.path.join(plots_dir, "alignment")
+    os.makedirs(plots_dir, exist_ok=True)
+    return plots_dir
+
+
+def plot_kernel_displacement(
+    displacement_df,
+    plots_dir,
+    n_hidden=None,
+    activity_lr=None,
+):
+    """Cosine similarity between the initial (``t=0``) and final (last
+    training step) feature kernel at every layer, at ``k=0`` for PC --
+    i.e. how much each layer's feature kernel moved during training.
+
+    ``displacement_df`` must have columns ``layer``, ``method`` (``"pc"``
+    or ``"bp"``), ``displacement``, ``gamma_0`` and ``n_infer_iters``.
+
+    If a single ``(gamma_0, n_infer_iters)`` combination is present, PC
+    and BP are overlaid as two curves. If several combinations are
+    present (``gamma_0s`` and/or ``n_infer_iters`` swept), only PC is
+    drawn, with one curve per combination (BP does not depend on
+    ``n_infer_iters`` and is dropped in this case).
+    """
+    if displacement_df is None or len(displacement_df) == 0:
+        print("No kernel displacement records to plot.")
+        return None
+
+    combos = (
+        displacement_df[["gamma_0", "n_infer_iters"]]
+        .drop_duplicates()
+        .sort_values(["gamma_0", "n_infer_iters"])
+    )
+    overlay = len(combos) > 1
+
+    plt.figure(figsize=(8, 6))
+    if not overlay:
+        # Per-column access (not row-wise .iloc) to avoid pandas upcasting
+        # gamma_0 (float) and n_infer_iters (int) to a common dtype.
+        gamma_0 = combos["gamma_0"].iloc[0]
+        n_infer_iters = int(combos["n_infer_iters"].iloc[0])
+
+        pc_sub = displacement_df[
+            displacement_df["method"] == "pc"
+        ].sort_values("layer")
+        layers = np.asarray(pc_sub["layer"], dtype=float) + 1
+        values = np.asarray(pc_sub["displacement"], dtype=float)
+        _warn_if_nonfinite("pc displacement", values)
+        plt.plot(layers, values, marker="o", color="tab:blue", label="PC")
+
+        bp_sub = displacement_df[
+            displacement_df["method"] == "bp"
+        ].sort_values("layer")
+        if len(bp_sub):
+            bp_layers = np.asarray(bp_sub["layer"], dtype=float) + 1
+            bp_values = np.asarray(bp_sub["displacement"], dtype=float)
+            _warn_if_nonfinite("bp displacement", bp_values)
+            plt.plot(
+                bp_layers, bp_values,
+                marker="s", color="tab:orange", label="Backprop",
+            )
+
+        out_dir = _alignment_plots_dir(
+            plots_dir,
+            n_hidden=n_hidden,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+            n_infer_iters=n_infer_iters,
+        )
+    else:
+        cmap = plt.get_cmap("viridis")
+        colors = [
+            cmap(i / max(1, len(combos) - 1)) for i in range(len(combos))
+        ]
+        pc_df = displacement_df[displacement_df["method"] == "pc"]
+        # itertuples (not iterrows) keeps each field's own dtype, since
+        # iterrows would coerce a mixed float/int row to a common dtype.
+        for row, color in zip(combos.itertuples(index=False), colors):
+            sub = pc_df[
+                (pc_df["gamma_0"] == row.gamma_0)
+                & (pc_df["n_infer_iters"] == row.n_infer_iters)
+            ].sort_values("layer")
+            if not len(sub):
+                continue
+            layers = np.asarray(sub["layer"], dtype=float) + 1
+            values = np.asarray(sub["displacement"], dtype=float)
+            _warn_if_nonfinite(
+                f"pc displacement (gamma_0={row.gamma_0}, "
+                f"K={row.n_infer_iters})",
+                values,
+            )
+            label = (
+                rf"PC, $\gamma_0={row.gamma_0}$, "
+                rf"$K={int(row.n_infer_iters)}$"
+            )
+            plt.plot(layers, values, marker="o", color=color, label=label)
+
+        out_dir = _alignment_plots_dir(
+            plots_dir, n_hidden=n_hidden, activity_lr=activity_lr
+        )
+
+    plt.xlabel(r"layer $\ell$")
+    plt.ylabel(r"$\cos(C^{\cdot,\ell}_{t=0}, C^{\cdot,\ell}_{t=T})$")
+    title = "Feature-kernel displacement across training"
+    if n_hidden is not None:
+        title += f", $H={int(n_hidden)}$"
+    if activity_lr is not None:
+        title += f", activity lr$={activity_lr}$"
+    plt.title(title)
+    plt.ylim(-1.05, 1.05)
+    plt.legend(fontsize=8)
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    save_path = os.path.join(out_dir, "kernel_displacement_vs_layer.png")
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"Kernel displacement plot saved to {save_path}")
+    return save_path
+
+
+def plot_pc_bp_kernel_alignment(
+    alignment_df,
+    plots_dir,
+    n_hidden=None,
+    activity_lr=None,
+):
+    """Cosine similarity between the final PC and final BP feature kernels
+    at every layer (both at the last training step; PC at ``k=0``).
+
+    ``alignment_df`` must have columns ``layer``, ``alignment``,
+    ``gamma_0`` and ``n_infer_iters``. One curve is drawn per
+    ``(gamma_0, n_infer_iters)`` combination present in the data.
+    """
+    if alignment_df is None or len(alignment_df) == 0:
+        print("No PC-BP kernel alignment records to plot.")
+        return None
+
+    combos = (
+        alignment_df[["gamma_0", "n_infer_iters"]]
+        .drop_duplicates()
+        .sort_values(["gamma_0", "n_infer_iters"])
+    )
+    cmap = plt.get_cmap("viridis")
+    colors = [cmap(i / max(1, len(combos) - 1)) for i in range(len(combos))]
+
+    plt.figure(figsize=(8, 6))
+    # itertuples (not iterrows) keeps each field's own dtype, since
+    # iterrows would coerce a mixed float/int row to a common dtype.
+    for row, color in zip(combos.itertuples(index=False), colors):
+        sub = alignment_df[
+            (alignment_df["gamma_0"] == row.gamma_0)
+            & (alignment_df["n_infer_iters"] == row.n_infer_iters)
+        ].sort_values("layer")
+        if not len(sub):
+            continue
+        layers = np.asarray(sub["layer"], dtype=float) + 1
+        values = np.asarray(sub["alignment"], dtype=float)
+        _warn_if_nonfinite(
+            f"pc-bp alignment (gamma_0={row.gamma_0}, "
+            f"K={row.n_infer_iters})",
+            values,
+        )
+        label = rf"$\gamma_0={row.gamma_0}$, $K={int(row.n_infer_iters)}$"
+        plt.plot(layers, values, marker="o", color=color, label=label)
+
+    if len(combos) == 1:
+        # Per-column access (not row-wise .iloc) to avoid pandas upcasting
+        # gamma_0 (float) and n_infer_iters (int) to a common dtype.
+        gamma_0 = combos["gamma_0"].iloc[0]
+        n_infer_iters = int(combos["n_infer_iters"].iloc[0])
+        out_dir = _alignment_plots_dir(
+            plots_dir,
+            n_hidden=n_hidden,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+            n_infer_iters=n_infer_iters,
+        )
+    else:
+        out_dir = _alignment_plots_dir(
+            plots_dir, n_hidden=n_hidden, activity_lr=activity_lr
+        )
+
+    plt.xlabel(r"layer $\ell$")
+    plt.ylabel(r"$\cos(C^{h,\ell}_{\mathrm{PC}}, H^{\ell}_{\mathrm{BP}})$")
+    title = "PC vs backprop final feature-kernel alignment"
+    if n_hidden is not None:
+        title += f", $H={int(n_hidden)}$"
+    if activity_lr is not None:
+        title += f", activity lr$={activity_lr}$"
+    plt.title(title)
+    plt.ylim(-1.05, 1.05)
+    plt.legend(fontsize=8)
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    save_path = os.path.join(out_dir, "pc_bp_kernel_alignment_vs_layer.png")
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"PC-BP kernel alignment plot saved to {save_path}")
+    return save_path
+
+
+def plot_final_kernel_grid(
+    pc_kernels,
+    plots_dir,
+    bp_kernels=None,
+    gamma_0=None,
+    n_hidden=None,
+    activity_lr=None,
+    n_infer_iters=None,
+):
+    """Grid of final-time sample-sample (``P x P``) feature kernels.
+
+    PC (``C^h`` at ``k=0``, last training step) fills the top row, one
+    panel per layer. When ``bp_kernels`` is given, the BP feature kernels
+    (``H``, last training step) fill a second row below for comparison.
+    """
+    pc_kernels = _to_numpy(pc_kernels)
+    n_layers = len(pc_kernels)
+    _warn_if_nonfinite(
+        "pc final kernels", np.stack([np.asarray(k) for k in pc_kernels])
+    )
+
+    show_bp = bp_kernels is not None
+    if show_bp:
+        bp_kernels = _to_numpy(bp_kernels)
+        if len(bp_kernels) != n_layers:
+            raise ValueError(
+                f"PC has {n_layers} layers but BP has {len(bp_kernels)}."
+            )
+        _warn_if_nonfinite(
+            "bp final kernels",
+            np.stack([np.asarray(k) for k in bp_kernels]),
+        )
+
+    n_rows = 2 if show_bp else 1
+    fig, axes = plt.subplots(
+        n_rows, n_layers, figsize=(2 * n_layers, 2 * n_rows), squeeze=False
+    )
+    for l, kernel in enumerate(pc_kernels):
+        ax = axes[0, l]
+        ax.imshow(np.asarray(kernel), cmap="coolwarm")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(rf"$\ell = {l + 1}$")
+        if l == 0:
+            ax.set_ylabel("PC")
+    if show_bp:
+        for l, kernel in enumerate(bp_kernels):
+            ax = axes[1, l]
+            ax.imshow(np.asarray(kernel), cmap="coolwarm")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if l == 0:
+                ax.set_ylabel("Backprop")
+
+    title = "Final feature kernels"
+    if n_hidden is not None:
+        title += f", $H={int(n_hidden)}$"
+    if gamma_0 is not None:
+        title += f", $\\gamma_0={gamma_0}$"
+    if activity_lr is not None:
+        title += f", activity lr$={activity_lr}$"
+    if n_infer_iters is not None:
+        title += f", $K={int(n_infer_iters)}$"
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+    )
+    save_path = os.path.join(out_dir, "final_kernels_grid.png")
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Final feature kernel grid saved to {save_path}")
+    return save_path
+
+
 def load_and_plot(results_dir, gamma_0, plots_dir=None, n_hidden=None):
     """Load saved DMFT results from results_dir and generate plots."""
     suffix = f"{gamma_0}_gamma_0"

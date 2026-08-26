@@ -89,7 +89,7 @@ def create_tiny_cifar10_dataset(key, D, P, class0=0, class1=1):
     return jnp.asarray(X), jnp.asarray(y)
 
 
-def cosine_similarity(a, b, axis=None, eps=1e-8):
+def cosine_similarity(a, b, axis=None, eps=1e-10):
     """Cosine similarity between two arrays, or pairwise over sequences.
 
     ``axis=None`` flattens both arrays (Frobenius / vector cosine sim).
@@ -170,9 +170,13 @@ def empirical_pc_kernel(field):
 
 
 def final_time_pc_kernel(
-    cov, num_inference_steps, num_training_steps, num_samples, k=0
+    cov, num_inference_steps, num_training_steps, num_samples, k=0, t=-1
 ):
-    """Sample-sample kernel at inference step ``k`` and the last training time."""
+    """Sample-sample kernel at inference step ``k`` and training time ``t``.
+
+    ``t`` defaults to ``-1`` (the last training step); pass ``t=0`` for the
+    kernel right after initialisation, before any parameter update.
+    """
     K1 = num_inference_steps + 1
     if not (0 <= k < K1):
         raise ValueError(
@@ -182,7 +186,19 @@ def final_time_pc_kernel(
     T = num_training_steps
     P = num_samples
     tensor = np.asarray(cov, dtype=np.float64).reshape(K1, T, P, K1, T, P)
-    return tensor[k, -1, :, k, -1, :]
+    return tensor[k, t, :, k, t, :]
+
+
+def bp_sample_kernel_at(kernel, t=-1):
+    """Sample-sample block of a BP feature kernel ``(T, P, T, P)`` at time ``t``.
+
+    ``t`` defaults to ``-1`` (the last training step); pass ``t=0`` for the
+    kernel right after initialisation, before any parameter update. Works
+    for both linear (``all_H``) and nonlinear (``all_Phi``) BP DMFT kernels,
+    which share this shape.
+    """
+    arr = np.asarray(kernel, dtype=np.float64)
+    return arr[t, :, t, :]
 
 
 def collect_final_pc_kernel_fields(
