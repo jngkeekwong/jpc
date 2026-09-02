@@ -416,6 +416,9 @@ def plot_pc_param_sweep_loss(
     are added: one curve per swept value, except for ``n_infer_iters`` where
     closed-form is independent of ``K`` so a single extra curve is drawn.
 
+    For ``n_infer_iters``, the DMFT theory curve is drawn only for the
+    smallest ``K`` (larger ``K`` are finite overlays only).
+
     If ``skip_theory`` is True, only finite overlays are drawn. If
     ``skip_finite`` is True, only DMFT theory curves are drawn.
     """
@@ -501,9 +504,15 @@ def plot_pc_param_sweep_loss(
             and g_theory is not None
             and len(g_theory)
         )
+        # K-sweep: DMFT is shown only for the smallest inference-step count.
+        min_swept = min(swept_values, key=lambda v: float(v))
         for value, color in zip(swept_values, colors):
             label = value_label(value)
-            if plot_theory:
+            plot_theory_this = plot_theory and (
+                swept_col != "n_infer_iters"
+                or float(value) == float(min_swept)
+            )
+            if plot_theory_this:
                 sub_th = g_theory[g_theory[swept_col] == value].sort_values("t")
                 if len(sub_th):
                     y = np.asarray(sub_th["loss"])

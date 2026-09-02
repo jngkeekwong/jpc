@@ -1,9 +1,10 @@
-"""Finite-width vs PC DMFT theory kernel-alignment analysis.
+"""PC DMFT theory vs finite-width analysis: kernels, width alignment, and loss.
 
-Split out of ``analyse_pc_loss.py`` (which handles PC loss across depth,
-gamma and inference steps). This script instead focuses on two PC plots,
-selected by ``--plot_mode`` (default ``auto``):
+Kernel / width figures are selected by ``--plot_mode`` (default ``auto``).
+Loss curves are always produced, including overlays when ``--n_hiddens``,
+``--gamma_0s``, or ``--n_infer_iters`` contain multiple values.
 
+Kernel / width figures:
 - ``kernels``: final feature-kernel grid (closed-form / infer / DMFT;
   closed-form omitted for nonlinear nets) at the largest ``--widths``
   value and the first seed. ``--skip_theory`` drops the DMFT row (and
@@ -15,7 +16,25 @@ selected by ``--plot_mode`` (default ``auto``):
 - ``both``: solve DMFT once, then run the ``kernels`` grid (largest
   width, first seed) and the ``width`` alignment sweep.
 - ``auto``: ``kernels`` if a single ``--widths`` value is given, else
-  ``both``.
+  ``both``. Extra ``K`` values (when several ``--n_infer_iters`` are
+  given) do not get kernel figures in ``auto``; pass ``kernels`` /
+  ``width`` / ``both`` to request them.
+
+Loss figures:
+- Single ``H``, ``gamma_0``, and ``K``: theory vs finite-size loss
+  (all widths) for that combination.
+- Several ``--n_hiddens``: overlay loss vs depth at the largest width.
+- Several ``--gamma_0s``: overlay loss vs ``gamma`` at the largest width.
+- Several ``--n_infer_iters``: overlay loss vs ``K`` at the largest
+  width. DMFT is solved and plotted only for the smallest ``K`` unless
+  kernel figures for the other ``K`` are requested (explicit
+  ``--plot_mode``). Linear nets also get one finite-size closed-form
+  curve (independent of ``K``).
+
+``--skip_theory`` skips DMFT on the kernel-grid-only path and on loss
+plots; it has no effect when the width-alignment path runs (theory is
+required). ``--skip_finite`` skips finite-width simulations (theory
+loss only; kernel figures are dropped).
 
 Theory is solved once per hyperparameter combination and reused across
 seeds. ``--seed`` draws three independent RNG streams (dataset, weight
@@ -58,6 +77,7 @@ from theory_pc_utils import solve_pc_kernels
 from theory_pc_nonlin_utils import solve_pc_kernels_nonlin, get_nonlinearity
 from plot_dmft_results import (
     plot_pc_theory_vs_finite_loss,
+    plot_pc_param_sweep_loss,
     plot_pc_kernel_width_alignment,
     plot_final_kernel_grid,
 )
@@ -86,11 +106,13 @@ def _train_finite_pc(
     seed,
     X_input,
     Y_target,
+    collect_fields=True,
 ):
     """Run one finite-width PC training job.
 
-    Returns the loss trajectory and hidden ``h`` at ``k=0`` / ``Δ`` at the
-    last inference step ``k=n_infer_iters`` of the trained network.
+    Returns the loss trajectory and, when ``collect_fields`` is True,
+    hidden ``h`` at ``k=0`` / ``Δ`` at the last inference step
+    ``k=n_infer_iters`` of the trained network (else ``None``).
     """
     save_dir = setup_pc_experiment(
         results_dir=results_dir,
@@ -140,6 +162,8 @@ def _train_finite_pc(
         loss_id=loss_id,
     )
     losses = np.load(f"{save_dir}/train_losses.npy")
+    if not collect_fields:
+        return losses, None
     fields = collect_final_pc_kernel_fields(
         model=model,
         skip_model=skip_model,
@@ -361,9 +385,18 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help=(
-            "On the kernel-grid-only path, skip PC DMFT theory and plot "
-            "finite-size closed-form and infer kernels. Has no effect when "
-            "the width-alignment path also runs (theory is required)."
+            "Skip PC DMFT theory on loss plots and on the kernel-grid-only "
+            "path. Has no effect when the width-alignment path also runs "
+            "(theory is required)."
+        ),
+    )
+    parser.add_argument(
+        "--skip_finite",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip finite-width PC simulations. Plots DMFT theory loss "
+            "only; kernel-grid and width-alignment figures are dropped."
         ),
     )
     parser.add_argument(
@@ -387,12 +420,20 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+    if args.skip_theory and args.skip_finite:
+        parser.error("Cannot set both --skip_theory and --skip_finite.")
 
     # PC DMFT inverts (K*T*P) matrices; float64 helps stability.
     jax.config.update("jax_enable_x64", True)
 
     os.makedirs(args.results_dir, exist_ok=True)
     use_nonlin_theory = args.act_fn != "linear"
+    overlay_n_hiddens = len(args.n_hiddens) > 1
+    overlay_gamma_0s = len(args.gamma_0s) > 1
+    overlay_n_infer_iters = len(args.n_infer_iters) > 1
+    overlay_any = (
+        overlay_n_hiddens or overlay_gamma_0s or overlay_n_infer_iters
+    )
     run_widths = list(args.widths)
     if args.plot_mode == "kernels":
         plot_kernels, plot_width = True, False
@@ -404,18 +445,40 @@ if __name__ == "__main__":
         # auto: single width -> kernel grid only; several widths -> both
         plot_kernels = True
         plot_width = len(run_widths) > 1
+    if args.skip_finite:
+        if plot_width:
+            print(
+                "skip_finite: skipping width-alignment "
+                "(needs finite-size simulations)"
+            )
+            plot_width = False
+        if plot_kernels:
+            print(
+                "skip_finite: skipping kernel grid "
+                "(needs finite-size simulations)"
+            )
+            plot_kernels = False
     kernel_plot_width = max(run_widths)
     kernel_grid_seed = args.seed
-    if plot_kernels and not plot_width:
+    # Loss overlays use the largest width; width-alignment needs every
+    # width. Kernel-grid-only likewise uses the largest width.
+    if overlay_any and not plot_width:
+        run_widths = [kernel_plot_width]
+    elif plot_kernels and not plot_width:
         run_widths = [kernel_plot_width]
     # Width-alignment always needs theory; skip_theory only applies when
-    # the kernel-grid path runs alone.
+    # the kernel-grid path runs alone (and to loss plots).
     skip_kernel_theory = args.skip_theory and plot_kernels and not plot_width
+    skip_loss_theory = args.skip_theory and not plot_width
     skip_closed_form = args.skip_closed_form and plot_kernels
+    explicit_kernel_mode = args.plot_mode in ("kernels", "width", "both")
+    min_K = min(args.n_infer_iters)
     print(
         f"plot_mode={args.plot_mode} "
         f"(kernels={plot_kernels}, width={plot_width}); "
+        f"overlay_any={overlay_any}; "
         f"skip_theory={skip_kernel_theory}; "
+        f"skip_finite={args.skip_finite}; "
         f"skip_closed_form={skip_closed_form}; "
         f"finite widths={run_widths}"
     )
@@ -470,12 +533,17 @@ if __name__ == "__main__":
         "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
     )
 
-    n_seeds_run = 1 if (plot_kernels and not plot_width) else args.n_seeds
+    n_seeds_run = 1 if (
+        (plot_kernels and not plot_width) or args.skip_finite
+    ) else args.n_seeds
     for seed in range(args.seed, args.seed + n_seeds_run):
         print(f"\nRunning experiment for seed: {seed}")
 
         set_seed(seed)
         model_key = jax.random.fold_in(model_parent, int(seed))
+
+        theory_records = []
+        finite_records = []
 
         for n_hidden in args.n_hiddens:
             print(f"\n\tn hidden H = {n_hidden}")
@@ -500,13 +568,33 @@ if __name__ == "__main__":
                             for K_inf in args.n_infer_iters:
                                 print(f"\n\t\t\t\t\t\tn_infer_iters = {K_inf}")
 
-                                # --- Calculate theory (PC), cached across seeds ---
                                 T_train = args.n_train_iters
                                 P = args.n_samples
-                                if skip_kernel_theory:
+                                # auto: kernel figures and DMFT only for
+                                # the smallest K unless --plot_mode is an
+                                # explicit kernels / width / both request.
+                                kernels_this_K = plot_kernels and (
+                                    explicit_kernel_mode or K_inf == min_K
+                                )
+                                width_this_K = plot_width and (
+                                    explicit_kernel_mode or K_inf == min_K
+                                )
+                                solve_theory = False
+                                if width_this_K:
+                                    solve_theory = True
+                                elif kernels_this_K and not skip_kernel_theory:
+                                    solve_theory = True
+                                elif (not skip_loss_theory) and (
+                                    (not overlay_n_infer_iters)
+                                    or K_inf == min_K
+                                ):
+                                    solve_theory = True
+
+                                # --- Calculate theory (PC), cached across seeds ---
+                                if not solve_theory:
                                     all_Ch = None
                                     all_Cdelta = None
-                                    pc_dmft_loss = jnp.zeros(T_train)
+                                    pc_dmft_loss = None
                                 else:
                                     theory_key = (
                                         n_hidden,
@@ -607,99 +695,131 @@ if __name__ == "__main__":
                                     param_type=param_type,
                                     use_skips=use_skips,
                                 )
+                                if pc_dmft_loss is not None:
+                                    theory_records.extend(
+                                        _loss_records(
+                                            pc_dmft_loss, **sweep_meta
+                                        )
+                                    )
+
+                                if width_this_K:
+                                    finite_widths = run_widths
+                                elif overlay_any:
+                                    finite_widths = [kernel_plot_width]
+                                else:
+                                    finite_widths = run_widths
+                                collect_fields = kernels_this_K or width_this_K
 
                                 # --- Finite-size PC simulation (infer) ---
-                                print(
-                                    "\t\t\t\t\tRunning finite-size PC simulation "
-                                    f"for widths {run_widths}...\n"
-                                )
                                 finite_pc_records = []
                                 infer_feature_kernels = None
-                                for width in run_widths:
+                                if not args.skip_finite:
                                     print(
-                                        "\t\t\t\t\tNumerical PC simulation "
-                                        f"for width N = {width}"
+                                        "\t\t\t\t\tRunning finite-size PC simulation "
+                                        f"for widths {finite_widths}...\n"
                                     )
-                                    losses, fields = _train_finite_pc(
-                                        width_key_map[width],
-                                        results_dir=args.results_dir,
-                                        input_dim=input_dim,
-                                        output_dim=output_dim,
-                                        n_samples=args.n_samples,
-                                        n_hidden=n_hidden,
-                                        use_skips=use_skips,
-                                        act_fn=args.act_fn,
-                                        param_type=param_type,
-                                        param_lr=args.param_lr_pc,
-                                        gamma_0=gamma_0,
-                                        param_optim_id=args.param_optim,
-                                        n_train_iters=T_train,
-                                        infer_mode="optim",
-                                        n_infer_iters=K_inf,
-                                        activity_lr=activity_lr,
-                                        width=width,
-                                        loss_id=loss_id,
-                                        seed=seed,
-                                        X_input=X_input,
-                                        Y_target=Y_target,
-                                    )
-                                    recs = _loss_records(
-                                        losses,
-                                        width=width,
-                                        infer_mode="infer",
-                                        **sweep_meta,
-                                    )
-                                    finite_pc_records.extend(recs)
-                                    if plot_width:
+                                    for width in finite_widths:
                                         print(
-                                            "\t\t\t\t\tKernel alignment "
+                                            "\t\t\t\t\tNumerical PC simulation "
                                             f"for width N = {width}"
                                         )
-                                        kernel_align_records.extend(
-                                            _kernel_align_records(
-                                                fields,
-                                                all_Ch,
-                                                all_Cdelta,
-                                                phi_fn,
-                                                num_inference_steps=K_inf,
-                                                num_training_steps=T_train,
-                                                num_samples=P,
-                                                width=width,
-                                                seed=seed,
-                                                **sweep_meta,
-                                            )
+                                        losses, fields = _train_finite_pc(
+                                            width_key_map[width],
+                                            results_dir=args.results_dir,
+                                            input_dim=input_dim,
+                                            output_dim=output_dim,
+                                            n_samples=args.n_samples,
+                                            n_hidden=n_hidden,
+                                            use_skips=use_skips,
+                                            act_fn=args.act_fn,
+                                            param_type=param_type,
+                                            param_lr=args.param_lr_pc,
+                                            gamma_0=gamma_0,
+                                            param_optim_id=args.param_optim,
+                                            n_train_iters=T_train,
+                                            infer_mode="optim",
+                                            n_infer_iters=K_inf,
+                                            activity_lr=activity_lr,
+                                            width=width,
+                                            loss_id=loss_id,
+                                            seed=seed,
+                                            X_input=X_input,
+                                            Y_target=Y_target,
+                                            collect_fields=collect_fields,
                                         )
-                                    if (
-                                        plot_kernels
-                                        and seed == kernel_grid_seed
-                                        and width == kernel_plot_width
-                                    ):
-                                        infer_feature_kernels = (
-                                            _final_feature_kernels(
-                                                fields, phi_fn
-                                            )
+                                        recs = _loss_records(
+                                            losses,
+                                            width=width,
+                                            infer_mode="infer",
+                                            **sweep_meta,
                                         )
-                                    del fields
+                                        finite_pc_records.extend(recs)
+                                        finite_records.extend(recs)
+                                        if width_this_K:
+                                            print(
+                                                "\t\t\t\t\tKernel alignment "
+                                                f"for width N = {width}"
+                                            )
+                                            kernel_align_records.extend(
+                                                _kernel_align_records(
+                                                    fields,
+                                                    all_Ch,
+                                                    all_Cdelta,
+                                                    phi_fn,
+                                                    num_inference_steps=K_inf,
+                                                    num_training_steps=T_train,
+                                                    num_samples=P,
+                                                    width=width,
+                                                    seed=seed,
+                                                    **sweep_meta,
+                                                )
+                                            )
+                                        if (
+                                            kernels_this_K
+                                            and seed == kernel_grid_seed
+                                            and width == kernel_plot_width
+                                        ):
+                                            infer_feature_kernels = (
+                                                _final_feature_kernels(
+                                                    fields, phi_fn
+                                                )
+                                            )
+                                        del fields
 
-                                finite_pc_df = pd.DataFrame(finite_pc_records)
                                 plots_dir = os.path.join(
                                     args.results_dir, "plots"
                                 )
-                                plot_pc_theory_vs_finite_loss(
-                                    pc_dmft_loss=pc_dmft_loss,
-                                    finite_df=finite_pc_df,
-                                    plots_dir=plots_dir,
-                                    gamma_0=gamma_0,
-                                    n_hidden=n_hidden,
-                                    activity_lr=activity_lr,
-                                    n_infer_iters=K_inf,
-                                    update_mode="infer",
-                                    skip_theory=skip_kernel_theory,
-                                )
+                                if not overlay_any:
+                                    plot_pc_theory_vs_finite_loss(
+                                        pc_dmft_loss=(
+                                            pc_dmft_loss
+                                            if pc_dmft_loss is not None
+                                            else jnp.zeros(T_train)
+                                        ),
+                                        finite_df=pd.DataFrame(
+                                            finite_pc_records
+                                        ),
+                                        plots_dir=plots_dir,
+                                        gamma_0=gamma_0,
+                                        n_hidden=n_hidden,
+                                        activity_lr=activity_lr,
+                                        n_infer_iters=K_inf,
+                                        update_mode="infer",
+                                        skip_theory=skip_loss_theory
+                                        or pc_dmft_loss is None,
+                                        skip_finite=args.skip_finite,
+                                    )
 
-                                if plot_kernels and seed == kernel_grid_seed:
+                                if (
+                                    kernels_this_K
+                                    and seed == kernel_grid_seed
+                                ):
                                     closed_form_feature_kernels = None
-                                    if not use_nonlin_theory and not skip_closed_form:
+                                    if (
+                                        not use_nonlin_theory
+                                        and not skip_closed_form
+                                        and not args.skip_finite
+                                    ):
                                         print(
                                             "\t\t\t\t\tNumerical PC simulation "
                                             "(closed-form) for width N = "
@@ -770,6 +890,84 @@ if __name__ == "__main__":
                                         share_clim=True,
                                     )
 
+                            if (
+                                overlay_n_infer_iters
+                                and (not args.skip_finite)
+                                and (not use_nonlin_theory)
+                            ):
+                                print(
+                                    "\t\t\t\t\tRunning finite-size PC "
+                                    "simulation (closed-form) for "
+                                    f"width N = {kernel_plot_width}...\n"
+                                )
+                                closed_losses, _ = _train_finite_pc(
+                                    width_key_map[kernel_plot_width],
+                                    results_dir=args.results_dir,
+                                    input_dim=input_dim,
+                                    output_dim=output_dim,
+                                    n_samples=args.n_samples,
+                                    n_hidden=n_hidden,
+                                    use_skips=use_skips,
+                                    act_fn=args.act_fn,
+                                    param_type=param_type,
+                                    param_lr=args.param_lr_pc,
+                                    gamma_0=gamma_0,
+                                    param_optim_id=args.param_optim,
+                                    n_train_iters=args.n_train_iters,
+                                    infer_mode="closed_form",
+                                    n_infer_iters=min_K,
+                                    activity_lr=activity_lr,
+                                    width=kernel_plot_width,
+                                    loss_id=loss_id,
+                                    seed=seed,
+                                    X_input=X_input,
+                                    Y_target=Y_target,
+                                    collect_fields=False,
+                                )
+                                finite_records.extend(
+                                    _loss_records(
+                                        closed_losses,
+                                        n_hidden=n_hidden,
+                                        gamma_0=gamma_0,
+                                        activity_lr=activity_lr,
+                                        n_infer_iters=min_K,
+                                        param_type=param_type,
+                                        use_skips=use_skips,
+                                        width=kernel_plot_width,
+                                        infer_mode="closed_form",
+                                    )
+                                )
+
+        if overlay_any:
+            theory_df = pd.DataFrame(theory_records)
+            finite_df = pd.DataFrame(finite_records)
+            plots_root = os.path.join(args.results_dir, "plots")
+            sweep_kwargs = dict(
+                theory_df=theory_df,
+                finite_df=finite_df,
+                plots_dir=plots_root,
+                skip_theory=skip_loss_theory,
+                skip_finite=args.skip_finite,
+            )
+            if overlay_n_hiddens:
+                plot_pc_param_sweep_loss(
+                    swept_col="n_hidden",
+                    plot_closed_form=False,
+                    **sweep_kwargs,
+                )
+            if overlay_gamma_0s:
+                plot_pc_param_sweep_loss(
+                    swept_col="gamma_0",
+                    plot_closed_form=False,
+                    **sweep_kwargs,
+                )
+            if overlay_n_infer_iters:
+                plot_pc_param_sweep_loss(
+                    swept_col="n_infer_iters",
+                    plot_closed_form=(not use_nonlin_theory),
+                    **sweep_kwargs,
+                )
+
     if plot_width:
         if kernel_align_records:
             align_df = pd.DataFrame(kernel_align_records)
@@ -809,34 +1007,36 @@ if __name__ == "__main__":
 ######### LINEAR ##########
 ###########################
 
-# Kernel alignment vs width (list of --widths; --plot_mode auto or width)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10 25 100 250 1000 2500 10000 --plot_mode width --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 400 --pc_damping 0.1 --pc_tolerance 1e-10 --n_seeds 3
+# Plot final feature kernels, finite-size only (no DMFT row)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --plot_mode kernels --skip_theory --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
 
-# Final feature kernel grid (single --widths; --plot_mode auto or kernels)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --plot_mode kernels --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --pc_tolerance 1e-5
+# Across depth
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 2 3 4 5  --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
 
-# Final feature kernel grid, finite-size only (no DMFT row)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --plot_mode kernels --skip_theory --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --pc_tolerance 1e-5
+# Across gamma
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
 
-# Final feature kernel grid, infer + DMFT only (no closed-form row)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --plot_mode kernels --skip_closed_form --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --pc_tolerance 1e-5
+# Across K (DMFT only for smallest K; closed-form finite-size overlay)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+
+# Across widths (convergence of kernels + plot final kernels)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 500 --pc_damping 0.05 --pc_tolerance 1e-10 --n_seeds 3
 
 
 ############ NONLINEAR ##################
 #########################################
 
-# Kernel alignment vs width + kernel grid after one DMFT solve
-# (--plot_mode both, or auto with several --widths)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence_nonlin.py --n_samples 8 --n_hiddens 3 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
-
-# Kernel alignment vs width only
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence_nonlin.py --n_samples 8 --n_hiddens 3 --widths 10 25 100 250 1000 2500 10000 --plot_mode width --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
-
-# Final feature kernel grid (single --widths; --plot_mode auto or kernels)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence_nonlin.py --n_samples 8 --n_hiddens 3 --widths 10000 --plot_mode kernels --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
-
-# Final feature kernel grid, finite-size only (no DMFT row)
+# Plot final feature kernels, finite-size only (no DMFT row)
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --plot_mode kernels --skip_theory --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
 
+# Across depth
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 1 2 3  --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
 
-# python analyse_convergence_nonlin.py --n_samples 2 --n_hiddens 3 --widths 100 1000 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 5 --n_train_iters 10 --n_fixed_point_steps 100 --pc_damping 0.05 --n_seeds 3 --act_fn tanh --dataset tiny-CIFAR10
+# Across gamma
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
+
+# Across K (DMFT only for smallest K)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 50 100 500 1000 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
+
+# Across widths (convergence of kernels + plot final kernels)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --n_seeds 3
