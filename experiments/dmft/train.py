@@ -180,48 +180,61 @@ if __name__ == "__main__":
             "--pc_only, or --skip_theory."
         )
 
+    # Three independent children of --seed: dataset, weight init, PC DMFT
+    # Monte Carlo. BP Monte Carlo is folded in so it does not reuse the PC
+    # key. Previously theory used PRNGKey(seed) / PRNGKey(0), which collide
+    # with the data and init streams.
+    data_key, model_parent, pc_theory_key = jax.random.split(
+        jax.random.PRNGKey(args.seed), 3
+    )
+    bp_theory_key = jax.random.fold_in(pc_theory_key, 1)
+
+    if args.dataset == "toy":
+        X, y = create_toy_dataset(
+            key=data_key, D=args.input_dim, P=args.n_samples
+        )
+        input_dim = args.input_dim
+        output_dim = 1
+    elif args.dataset == "tiny-CIFAR10":
+        input_dim = CIFAR_GRAY_DIM
+        X, y = create_tiny_cifar10_dataset(
+            key=data_key, D=input_dim, P=args.n_samples
+        )
+        output_dim = 1
+        print(f"Input dim: {input_dim}, Output dim: {output_dim}")
+    else:
+        from torch import Generator as TorchGenerator
+
+        loader_gen = TorchGenerator()
+        loader_gen.manual_seed(int(np.asarray(data_key)[0]) & 0x7FFFFFFF)
+        train_loader, _ = get_dataloaders(
+            args.dataset, args.n_samples, generator=loader_gen
+        )
+        img_batch, label_batch = next(iter(train_loader))
+
+        input_dim = img_batch.shape[1]
+        output_dim = label_batch.shape[1]
+        print(f"Input dim: {input_dim}, Output dim: {output_dim}")
+
+        X = img_batch.numpy().T
+        y = label_batch.numpy()
+
+    Kx = jnp.asarray(X.T @ X / input_dim, dtype=jnp.float64)
+    X_input = jnp.asarray(X.T, dtype=jnp.float64)
+    Y_target = y[:, None] if y.ndim == 1 else y
+    Y_target = jnp.asarray(Y_target, dtype=jnp.float64)
+    y_bp = jnp.squeeze(Y_target, axis=-1) if Y_target.ndim == 2 and Y_target.shape[-1] == 1 else y
+    loss_id = (
+        "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
+    )
+    bp_theory_cache = {}
+    pc_theory_cache = {}
+
     for seed in range(args.seed, args.seed + args.n_seeds):
         print(f"\nRunning experiment for seed: {seed}")
 
-        # --- Set Seed ---
         set_seed(seed)
-        key = jax.random.PRNGKey(seed)
-        data_key, model_key = jax.random.split(key)
-
-        # --- Setup Dataset ---
-        if args.dataset == "toy":
-            X, y = create_toy_dataset(
-                key=data_key, D=args.input_dim, P=args.n_samples
-            )
-            input_dim = args.input_dim
-            output_dim = 1
-        elif args.dataset == "tiny-CIFAR10":
-            input_dim = CIFAR_GRAY_DIM
-            X, y = create_tiny_cifar10_dataset(
-                key=data_key, D=input_dim, P=args.n_samples
-            )
-            output_dim = 1
-            print(f"Input dim: {input_dim}, Output dim: {output_dim}")
-        else:
-            train_loader, _ = get_dataloaders(args.dataset, args.n_samples)
-            img_batch, label_batch = next(iter(train_loader))
-
-            input_dim = img_batch.shape[1]
-            output_dim = label_batch.shape[1]
-            print(f"Input dim: {input_dim}, Output dim: {output_dim}")
-
-            X = img_batch.numpy().T
-            y = label_batch.numpy()
-
-        Kx = X.T @ X / input_dim
-
-        # In this dataset, we treat the whole P samples as one batch, matching
-        # the convention assumed by the (whole-batch) DMFT theory.
-        X_input = X.T  # Shape (P, D)
-        Y_target = y[:, None] if y.ndim == 1 else y
-        loss_id = (
-            "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
-        )
+        model_key = jax.random.fold_in(model_parent, int(seed))
 
         for n_hidden in args.n_hiddens:
             print(f"\n\tn hidden H = {n_hidden}")
@@ -242,17 +255,25 @@ if __name__ == "__main__":
                         for activity_lr in args.activity_lrs:
                             print(f"\n\t\t\t\t\tactivity_lr = {activity_lr}")
 
-                            # --- Calculate theory (BP) ---
+                            # --- Calculate theory (BP), cached across seeds / activity_lr ---
                             dmft_loss = None
                             if not args.pc_only and not args.skip_theory:
-                                if use_nonlin_theory:
+                                bp_key = (
+                                    n_hidden,
+                                    bool(use_skips),
+                                    gamma_0,
+                                    param_type,
+                                )
+                                if bp_key in bp_theory_cache:
+                                    all_H, all_G, dmft_loss = bp_theory_cache[bp_key]
+                                elif use_nonlin_theory:
                                     print(
                                         "\t\t\t\t\tCalculating nonlinear BP "
                                         f"Theory (act_fn={args.act_fn})...\n"
                                     )
                                     all_H, all_G, _, _ = solve_kernels_nonlin(
                                         Kx=Kx,
-                                        y=y,
+                                        y=y_bp,
                                         depth=n_hidden,
                                         eta=args.param_lr,
                                         gamma=gamma_0,
@@ -262,10 +283,11 @@ if __name__ == "__main__":
                                         damping=args.bp_damping,
                                         nonlin=args.act_fn,
                                         beta=args.nonlin_beta,
+                                        key=bp_theory_key,
                                     )
                                     Delta_theory = solve_Delta(
                                         Kx=Kx,
-                                        y=y,
+                                        y=y_bp,
                                         all_Phi=all_H,
                                         all_G=all_G,
                                         eta=args.param_lr,
@@ -273,11 +295,14 @@ if __name__ == "__main__":
                                     dmft_loss = 0.5 * jnp.mean(
                                         Delta_theory**2, axis=1
                                     )
+                                    bp_theory_cache[bp_key] = (
+                                        all_H, all_G, dmft_loss
+                                    )
                                 else:
                                     print("\t\t\t\t\tCalculating BP Theory...\n")
                                     all_H, all_G, _, _ = solve_kernels(
                                         Kx=Kx,
-                                        y=y,
+                                        y=y_bp,
                                         depth=n_hidden,
                                         eta=args.param_lr,
                                         gamma=gamma_0,
@@ -288,11 +313,14 @@ if __name__ == "__main__":
                                         all_H=all_H,
                                         all_G=all_G,
                                         Kx=Kx,
-                                        y=y,
+                                        y=y_bp,
                                         eta=args.param_lr
                                     )
                                     dmft_loss = 0.5 * jnp.mean(
                                         jnp.sum(Delta_theory**2, axis=2), axis=1
+                                    )
+                                    bp_theory_cache[bp_key] = (
+                                        all_H, all_G, dmft_loss
                                     )
                                 # np.save(f"{args.results_dir}/all_H_{gamma_0}_gamma_0.npy", all_H)
                                 # np.save(f"{args.results_dir}/all_G_{gamma_0}_gamma_0.npy", all_G)
@@ -398,84 +426,103 @@ if __name__ == "__main__":
                                     skip_theory=args.skip_theory,
                                 )
 
-                            # --- Calculate theory (PC) ---
+                            # --- Calculate theory (PC), cached across seeds ---
                             pc_dmft_loss = None
                             K_inf = args.n_infer_iters
                             T_train = args.n_train_iters
                             P = args.n_samples
                             if not args.skip_theory:
-                                n_pc = K_inf * T_train * P
-                                if use_nonlin_theory:
-                                    print(
-                                        "\t\t\t\t\tCalculating nonlinear PC Theory "
-                                        f"(act_fn={args.act_fn}, "
-                                        f"matrix size n = K*T*P = {n_pc})...\n"
-                                    )
-                                    (
-                                        all_Ch,
-                                        all_Cdelta,
-                                        _all_Rh,
-                                        _all_Rdelta,
-                                        _C_delta_top,
-                                        pc_dmft_loss,
-                                        _mean_delta_top,
-                                        pc_diagnostics,
-                                    ) = solve_pc_kernels_nonlin(
-                                        Kx=jnp.asarray(Kx, dtype=jnp.float64),
-                                        y=y,
-                                        depth=n_hidden,
-                                        eta=args.param_lr_pc,
-                                        gamma=gamma_0,
-                                        beta_h=activity_lr,
-                                        hidden_energy_scaling=n_hidden + 1,
-                                        num_training_steps=T_train,
-                                        num_inference_steps=K_inf,
-                                        num_fixed_point_steps=args.n_fixed_point_steps,
-                                        num_mc_samples=args.num_mc_samples,
-                                        num_jacobian_samples=args.num_jacobian_samples,
-                                        jacobian_batch_size=args.jacobian_batch_size,
-                                        damping=args.pc_damping,
-                                        nonlinearity=args.act_fn,
-                                        beta=args.nonlin_beta,
-                                        tolerance=args.pc_tolerance,
-                                        seed=seed,
-                                    )
-                                else:
-                                    print(
-                                        "\t\t\t\t\tCalculating PC Theory "
-                                        f"(matrix size n = K*T*P = {n_pc})...\n"
-                                    )
-                                    (
-                                        all_Ch,
-                                        all_Cdelta,
-                                        _all_Rh,
-                                        _all_Rdelta,
-                                        _C_delta_top,
-                                        pc_dmft_loss,
-                                        _mean_delta_top,
-                                        pc_diagnostics,
-                                    ) = solve_pc_kernels(
-                                        Kx=jnp.asarray(Kx, dtype=jnp.float64),
-                                        y=y,
-                                        depth=n_hidden,
-                                        eta=args.param_lr_pc,
-                                        gamma=gamma_0,
-                                        beta_h=activity_lr,
-                                        hidden_energy_scaling=n_hidden + 1,
-                                        num_training_steps=T_train,
-                                        num_inference_steps=K_inf,
-                                        num_fixed_point_steps=args.n_fixed_point_steps,
-                                        damping=args.pc_damping,
-                                        tolerance=args.pc_tolerance,
-                                        backend=args.pc_backend,
-                                    )
-                                print(
-                                    "\t\t\t\t\tPC fixed-point residual = "
-                                    f"{float(pc_diagnostics['fixed_point_residual']):.3e}, "
-                                    "equation residual = "
-                                    f"{float(pc_diagnostics['equation_residual']):.3e} "
-                                    f"after {pc_diagnostics['iterations']} iters\n"
+                                pc_key = (
+                                    n_hidden,
+                                    bool(use_skips),
+                                    gamma_0,
+                                    param_type,
+                                    activity_lr,
                                 )
+                                if pc_key in pc_theory_cache:
+                                    (
+                                        all_Ch,
+                                        all_Cdelta,
+                                        pc_dmft_loss,
+                                    ) = pc_theory_cache[pc_key]
+                                else:
+                                    n_pc = K_inf * T_train * P
+                                    if use_nonlin_theory:
+                                        print(
+                                            "\t\t\t\t\tCalculating nonlinear PC Theory "
+                                            f"(act_fn={args.act_fn}, "
+                                            f"matrix size n = K*T*P = {n_pc})...\n"
+                                        )
+                                        (
+                                            all_Ch,
+                                            all_Cdelta,
+                                            _all_Rh,
+                                            _all_Rdelta,
+                                            _C_delta_top,
+                                            pc_dmft_loss,
+                                            _mean_delta_top,
+                                            pc_diagnostics,
+                                        ) = solve_pc_kernels_nonlin(
+                                            Kx=Kx,
+                                            y=Y_target,
+                                            depth=n_hidden,
+                                            eta=args.param_lr_pc,
+                                            gamma=gamma_0,
+                                            beta_h=activity_lr,
+                                            hidden_energy_scaling=n_hidden + 1,
+                                            num_training_steps=T_train,
+                                            num_inference_steps=K_inf,
+                                            num_fixed_point_steps=args.n_fixed_point_steps,
+                                            num_mc_samples=args.num_mc_samples,
+                                            num_jacobian_samples=args.num_jacobian_samples,
+                                            jacobian_batch_size=args.jacobian_batch_size,
+                                            damping=args.pc_damping,
+                                            nonlinearity=args.act_fn,
+                                            beta=args.nonlin_beta,
+                                            tolerance=args.pc_tolerance,
+                                            key=pc_theory_key,
+                                        )
+                                    else:
+                                        print(
+                                            "\t\t\t\t\tCalculating PC Theory "
+                                            f"(matrix size n = K*T*P = {n_pc})...\n"
+                                        )
+                                        (
+                                            all_Ch,
+                                            all_Cdelta,
+                                            _all_Rh,
+                                            _all_Rdelta,
+                                            _C_delta_top,
+                                            pc_dmft_loss,
+                                            _mean_delta_top,
+                                            pc_diagnostics,
+                                        ) = solve_pc_kernels(
+                                            Kx=Kx,
+                                            y=Y_target,
+                                            depth=n_hidden,
+                                            eta=args.param_lr_pc,
+                                            gamma=gamma_0,
+                                            beta_h=activity_lr,
+                                            hidden_energy_scaling=n_hidden + 1,
+                                            num_training_steps=T_train,
+                                            num_inference_steps=K_inf,
+                                            num_fixed_point_steps=args.n_fixed_point_steps,
+                                            damping=args.pc_damping,
+                                            tolerance=args.pc_tolerance,
+                                            backend=args.pc_backend,
+                                        )
+                                    print(
+                                        "\t\t\t\t\tPC fixed-point residual = "
+                                        f"{float(pc_diagnostics['fixed_point_residual']):.3e}, "
+                                        "equation residual = "
+                                        f"{float(pc_diagnostics['equation_residual']):.3e} "
+                                        f"after {pc_diagnostics['iterations']} iters\n"
+                                    )
+                                    pc_theory_cache[pc_key] = (
+                                        all_Ch,
+                                        all_Cdelta,
+                                        pc_dmft_loss,
+                                    )
                                 suffix = (
                                     f"{gamma_0}_gamma_0_"
                                     f"{activity_lr}_activity_lr"

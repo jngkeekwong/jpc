@@ -3,6 +3,11 @@
 Runs PC DMFT theory, then BP DMFT theory, and plots kernel displacement
 and PC–BP feature-kernel alignment. Finite-width simulations are omitted.
 
+``--seed`` draws three independent RNG streams (dataset, weight init,
+PC DMFT Monte Carlo). BP Monte Carlo is folded in from the PC stream so
+the two solvers do not share keys. Theory always uses the same ``(X, y)``
+as would a finite-size run with this seed.
+
 Use the ``PC_dmft_env`` conda environment:
     /data/ndcn-computational-neuroscience/mert5001/envs/PC_dmft_env/bin/python analyse_alignment.py
 """
@@ -12,6 +17,7 @@ import argparse
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pandas as pd
 
 from experiments.datasets import get_dataloaders
@@ -224,46 +230,58 @@ if __name__ == "__main__":
             "or --skip_theory_bp."
         )
 
+    data_key, _model_parent, pc_theory_key = jax.random.split(
+        jax.random.PRNGKey(args.seed), 3
+    )
+    bp_theory_key = jax.random.fold_in(pc_theory_key, 1)
+
+    if args.dataset == "toy":
+        X, y = create_toy_dataset(
+            key=data_key, D=args.input_dim, P=args.n_samples
+        )
+        input_dim = args.input_dim
+    elif args.dataset == "tiny-CIFAR10":
+        input_dim = CIFAR_GRAY_DIM
+        X, y = create_tiny_cifar10_dataset(
+            key=data_key, D=input_dim, P=args.n_samples
+        )
+        print(f"Input dim: {input_dim}")
+    else:
+        from torch import Generator as TorchGenerator
+
+        loader_gen = TorchGenerator()
+        loader_gen.manual_seed(int(np.asarray(data_key)[0]) & 0x7FFFFFFF)
+        train_loader, _ = get_dataloaders(
+            args.dataset, args.n_samples, generator=loader_gen
+        )
+        img_batch, label_batch = next(iter(train_loader))
+
+        input_dim = img_batch.shape[1]
+        print(f"Input dim: {input_dim}, Output dim: {label_batch.shape[1]}")
+
+        X = img_batch.numpy().T
+        y = label_batch.numpy()
+
+    Kx = jnp.asarray(X.T @ X / input_dim, dtype=jnp.float64)
+    Y_target = y[:, None] if y.ndim == 1 else y
+    Y_target = jnp.asarray(Y_target, dtype=jnp.float64)
+    y_bp = (
+        jnp.squeeze(Y_target, axis=-1)
+        if Y_target.ndim == 2 and Y_target.shape[-1] == 1
+        else jnp.asarray(y)
+    )
+    # BP theory does not depend on activity_lr or n_infer_iters; PC theory
+    # is cached across --n_seeds since the dataset is fixed.
+    bp_theory_cache = {}
+    pc_theory_cache = {}
+
     for seed in range(args.seed, args.seed + args.n_seeds):
         print(f"\nRunning experiment for seed: {seed}")
 
-        # --- Set Seed ---
         set_seed(seed)
-        key = jax.random.PRNGKey(seed)
-        data_key, _ = jax.random.split(key)
 
-        # --- Setup Dataset ---
-        if args.dataset == "toy":
-            X, y = create_toy_dataset(
-                key=data_key, D=args.input_dim, P=args.n_samples
-            )
-            input_dim = args.input_dim
-        elif args.dataset == "tiny-CIFAR10":
-            input_dim = CIFAR_GRAY_DIM
-            X, y = create_tiny_cifar10_dataset(
-                key=data_key, D=input_dim, P=args.n_samples
-            )
-            print(f"Input dim: {input_dim}")
-        else:
-            train_loader, _ = get_dataloaders(args.dataset, args.n_samples)
-            img_batch, label_batch = next(iter(train_loader))
-
-            input_dim = img_batch.shape[1]
-            print(f"Input dim: {input_dim}, Output dim: {label_batch.shape[1]}")
-
-            X = img_batch.numpy().T
-            y = label_batch.numpy()
-
-        Kx = X.T @ X / input_dim
-
-        # Feature-kernel displacement / PC-BP alignment records, accumulated
-        # across the whole sweep below and plotted (grouped by n_hidden,
-        # use_skips, param_type, activity_lr) once the sweep is done.
         displacement_records = []
         pcbp_alignment_records = []
-        # BP theory does not depend on activity_lr or n_infer_iters, so it
-        # is cached to avoid recomputing it for every value of either.
-        bp_theory_cache = {}
 
         for n_hidden in args.n_hiddens:
             print(f"\n\tn hidden H = {n_hidden}")
@@ -292,91 +310,109 @@ if __name__ == "__main__":
                                     args.results_dir, "plots"
                                 )
 
-                                # --- Calculate theory (PC) ---
+                                # --- Calculate theory (PC), cached across seeds ---
                                 n_pc = K_inf * T_train * P
-                                if use_nonlin_theory:
-                                    print(
-                                        "\t\t\t\t\t\tCalculating nonlinear PC "
-                                        f"Theory (act_fn={args.act_fn}, "
-                                        f"matrix size n = K*T*P = {n_pc})...\n"
-                                    )
-                                    (
-                                        all_Ch,
-                                        all_Cdelta,
-                                        _all_Rh,
-                                        _all_Rdelta,
-                                        _C_delta_top,
-                                        pc_dmft_loss,
-                                        _mean_delta_top,
-                                        pc_diagnostics,
-                                    ) = solve_pc_kernels_nonlin(
-                                        Kx=jnp.asarray(Kx, dtype=jnp.float64),
-                                        y=y,
-                                        depth=n_hidden,
-                                        eta=args.param_lr_pc,
-                                        gamma=gamma_0,
-                                        beta_h=activity_lr,
-                                        hidden_energy_scaling=n_hidden + 1,
-                                        num_training_steps=T_train,
-                                        num_inference_steps=K_inf,
-                                        num_fixed_point_steps=args.n_fixed_point_steps,
-                                        num_mc_samples=args.num_mc_samples,
-                                        num_jacobian_samples=args.num_jacobian_samples,
-                                        jacobian_batch_size=args.jacobian_batch_size,
-                                        damping=args.pc_damping,
-                                        nonlinearity=args.act_fn,
-                                        beta=args.nonlin_beta,
-                                        tolerance=args.pc_tolerance,
-                                        seed=seed,
+                                pc_key = (
+                                    n_hidden,
+                                    bool(use_skips),
+                                    gamma_0,
+                                    param_type,
+                                    activity_lr,
+                                    K_inf,
+                                )
+                                if pc_key in pc_theory_cache:
+                                    all_Ch, all_Cdelta, pc_dmft_loss = (
+                                        pc_theory_cache[pc_key]
                                     )
                                 else:
+                                    if use_nonlin_theory:
+                                        print(
+                                            "\t\t\t\t\t\tCalculating nonlinear PC "
+                                            f"Theory (act_fn={args.act_fn}, "
+                                            f"matrix size n = K*T*P = {n_pc})...\n"
+                                        )
+                                        (
+                                            all_Ch,
+                                            all_Cdelta,
+                                            _all_Rh,
+                                            _all_Rdelta,
+                                            _C_delta_top,
+                                            pc_dmft_loss,
+                                            _mean_delta_top,
+                                            pc_diagnostics,
+                                        ) = solve_pc_kernels_nonlin(
+                                            Kx=Kx,
+                                            y=Y_target,
+                                            depth=n_hidden,
+                                            eta=args.param_lr_pc,
+                                            gamma=gamma_0,
+                                            beta_h=activity_lr,
+                                            hidden_energy_scaling=n_hidden + 1,
+                                            num_training_steps=T_train,
+                                            num_inference_steps=K_inf,
+                                            num_fixed_point_steps=args.n_fixed_point_steps,
+                                            num_mc_samples=args.num_mc_samples,
+                                            num_jacobian_samples=args.num_jacobian_samples,
+                                            jacobian_batch_size=args.jacobian_batch_size,
+                                            damping=args.pc_damping,
+                                            nonlinearity=args.act_fn,
+                                            beta=args.nonlin_beta,
+                                            tolerance=args.pc_tolerance,
+                                            key=pc_theory_key,
+                                        )
+                                    else:
+                                        print(
+                                            "\t\t\t\t\t\tCalculating PC Theory "
+                                            f"(matrix size n = K*T*P = {n_pc})...\n"
+                                        )
+                                        (
+                                            all_Ch,
+                                            all_Cdelta,
+                                            _all_Rh,
+                                            _all_Rdelta,
+                                            _C_delta_top,
+                                            pc_dmft_loss,
+                                            _mean_delta_top,
+                                            pc_diagnostics,
+                                        ) = solve_pc_kernels(
+                                            Kx=Kx,
+                                            y=Y_target,
+                                            depth=n_hidden,
+                                            eta=args.param_lr_pc,
+                                            gamma=gamma_0,
+                                            beta_h=activity_lr,
+                                            hidden_energy_scaling=n_hidden + 1,
+                                            num_training_steps=T_train,
+                                            num_inference_steps=K_inf,
+                                            num_fixed_point_steps=args.n_fixed_point_steps,
+                                            damping=args.pc_damping,
+                                            tolerance=args.pc_tolerance,
+                                            backend=args.pc_backend,
+                                        )
                                     print(
-                                        "\t\t\t\t\t\tCalculating PC Theory "
-                                        f"(matrix size n = K*T*P = {n_pc})...\n"
+                                        "\t\t\t\t\t\tPC fixed-point residual = "
+                                        f"{float(pc_diagnostics['fixed_point_residual']):.3e}, "
+                                        "equation residual = "
+                                        f"{float(pc_diagnostics['equation_residual']):.3e} "
+                                        f"after {pc_diagnostics['iterations']} iters\n"
                                     )
-                                    (
+                                    plot_pc_dmft_kernels_and_loss(
+                                        all_Ch=all_Ch,
+                                        all_Cdelta=all_Cdelta,
+                                        pc_dmft_loss=pc_dmft_loss,
+                                        plots_dir=plots_dir,
+                                        num_inference_steps=K_inf,
+                                        num_training_steps=T_train,
+                                        num_samples=P,
+                                        gamma_0=gamma_0,
+                                        n_hidden=n_hidden,
+                                        activity_lr=activity_lr,
+                                    )
+                                    pc_theory_cache[pc_key] = (
                                         all_Ch,
                                         all_Cdelta,
-                                        _all_Rh,
-                                        _all_Rdelta,
-                                        _C_delta_top,
                                         pc_dmft_loss,
-                                        _mean_delta_top,
-                                        pc_diagnostics,
-                                    ) = solve_pc_kernels(
-                                        Kx=jnp.asarray(Kx, dtype=jnp.float64),
-                                        y=y,
-                                        depth=n_hidden,
-                                        eta=args.param_lr_pc,
-                                        gamma=gamma_0,
-                                        beta_h=activity_lr,
-                                        hidden_energy_scaling=n_hidden + 1,
-                                        num_training_steps=T_train,
-                                        num_inference_steps=K_inf,
-                                        num_fixed_point_steps=args.n_fixed_point_steps,
-                                        damping=args.pc_damping,
-                                        tolerance=args.pc_tolerance,
-                                        backend=args.pc_backend,
                                     )
-                                print(
-                                    "\t\t\t\t\t\tPC fixed-point residual = "
-                                    f"{float(pc_diagnostics['fixed_point_residual']):.3e}, "
-                                    "equation residual = "
-                                    f"{float(pc_diagnostics['equation_residual']):.3e} "
-                                    f"after {pc_diagnostics['iterations']} iters\n"
-                                )
-                                plot_pc_dmft_kernels_and_loss(
-                                    all_Ch=all_Ch,
-                                    all_Cdelta=all_Cdelta,
-                                    pc_dmft_loss=pc_dmft_loss,
-                                    plots_dir=plots_dir,
-                                    num_inference_steps=K_inf,
-                                    num_training_steps=T_train,
-                                    num_samples=P,
-                                    gamma_0=gamma_0,
-                                    n_hidden=n_hidden,
-                                    activity_lr=activity_lr,
-                                )
 
                                 # --- Calculate theory (BP), cached since it
                                 # does not depend on activity_lr / K_inf ---
@@ -402,7 +438,7 @@ if __name__ == "__main__":
                                             all_H, all_G, _, _ = (
                                                 solve_kernels_nonlin(
                                                     Kx=Kx,
-                                                    y=y,
+                                                    y=y_bp,
                                                     depth=n_hidden,
                                                     eta=args.param_lr,
                                                     gamma=gamma_0,
@@ -412,11 +448,12 @@ if __name__ == "__main__":
                                                     damping=args.bp_damping,
                                                     nonlin=args.act_fn,
                                                     beta=args.nonlin_beta,
+                                                    key=bp_theory_key,
                                                 )
                                             )
                                             Delta_theory = solve_Delta(
                                                 Kx=Kx,
-                                                y=y,
+                                                y=y_bp,
                                                 all_Phi=all_H,
                                                 all_G=all_G,
                                                 eta=args.param_lr,
@@ -431,7 +468,7 @@ if __name__ == "__main__":
                                             )
                                             all_H, all_G, _, _ = solve_kernels(
                                                 Kx=Kx,
-                                                y=y,
+                                                y=y_bp,
                                                 depth=n_hidden,
                                                 eta=args.param_lr,
                                                 gamma=gamma_0,
@@ -442,7 +479,7 @@ if __name__ == "__main__":
                                                 all_H=all_H,
                                                 all_G=all_G,
                                                 Kx=Kx,
-                                                y=y,
+                                                y=y_bp,
                                                 eta=args.param_lr
                                             )
                                             dmft_loss = 0.5 * jnp.mean(
@@ -489,9 +526,13 @@ if __name__ == "__main__":
                                 displacement_records.extend(disp_recs)
                                 pcbp_alignment_records.extend(align_recs)
 
+                                kernel_rows = [("PC", pc_final_kernels)]
+                                if bp_final_kernels is not None:
+                                    kernel_rows.append(
+                                        ("Backprop", bp_final_kernels)
+                                    )
                                 plot_final_kernel_grid(
-                                    pc_kernels=pc_final_kernels,
-                                    bp_kernels=bp_final_kernels,
+                                    kernel_rows,
                                     plots_dir=plots_dir,
                                     gamma_0=gamma_0,
                                     n_hidden=n_hidden,

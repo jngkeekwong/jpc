@@ -240,6 +240,7 @@ def plot_pc_theory_vs_finite_loss(
     n_infer_iters=None,
     update_mode=None,
     skip_theory=False,
+    skip_finite=False,
 ):
     """Overlay the PC DMFT theory loss curve with finite-size empirical losses.
 
@@ -255,6 +256,8 @@ def plot_pc_theory_vs_finite_loss(
 
     If ``skip_theory`` is True (or ``pc_dmft_loss`` is None / all zeros), only
     finite overlays are drawn and the title/filename use ``pc_finite_loss``.
+    If ``skip_finite`` is True (or ``finite_df`` is empty), only the DMFT
+    theory curve is drawn and the title/filename use ``pc_theory_loss``.
     """
     if n_hidden is not None:
         plots_dir = os.path.join(plots_dir, f"{n_hidden}_n_hidden")
@@ -276,21 +279,30 @@ def plot_pc_theory_vs_finite_loss(
         else:
             _warn_if_nonfinite("pc_dmft_loss", pc_dmft_loss)
 
-    widths = sorted(finite_df["width"].unique())
+    plot_finite = (
+        (not skip_finite)
+        and finite_df is not None
+        and len(finite_df)
+        and "width" in finite_df.columns
+    )
+    widths = (
+        sorted(finite_df["width"].unique()) if plot_finite else []
+    )
     cmap = plt.get_cmap("viridis")
     colors = [cmap(i / max(1, len(widths) - 1)) for i in range(len(widths))]
 
     plt.figure(figsize=(8, 6))
-    for width, color in zip(widths, colors):
-        sub = finite_df[finite_df["width"] == width].sort_values("t")
-        plt.plot(
-            sub["t"],
-            sub["loss"],
-            marker="o",
-            color=color,
-            alpha=0.8,
-            label=f"width={width}",
-        )
+    if plot_finite:
+        for width, color in zip(widths, colors):
+            sub = finite_df[finite_df["width"] == width].sort_values("t")
+            plt.plot(
+                sub["t"],
+                sub["loss"],
+                marker="o",
+                color=color,
+                alpha=0.8,
+                label=f"width={width}",
+            )
     if plot_theory:
         theory_t = np.arange(1, len(pc_dmft_loss) + 1)
         plt.plot(
@@ -303,7 +315,10 @@ def plot_pc_theory_vs_finite_loss(
         )
     plt.xlabel("$t$")
     plt.ylabel("PC training loss (MSE)")
-    if skip_theory or not plot_theory:
+    if skip_finite or (plot_theory and not plot_finite):
+        title = "PC DMFT theory"
+        filename = "pc_theory_loss"
+    elif skip_theory or not plot_theory:
         title = "PC finite-size simulation"
         filename = "pc_finite_loss"
     else:
@@ -391,6 +406,7 @@ def plot_pc_param_sweep_loss(
     plots_dir,
     swept_col,
     skip_theory=False,
+    skip_finite=False,
     plot_closed_form=False,
 ):
     """Overlay theory and finite-size losses for every value of ``swept_col``.
@@ -399,6 +415,9 @@ def plot_pc_param_sweep_loss(
     infer is solid. If ``plot_closed_form`` is True, closed-form finite updates
     are added: one curve per swept value, except for ``n_infer_iters`` where
     closed-form is independent of ``K`` so a single extra curve is drawn.
+
+    If ``skip_theory`` is True, only finite overlays are drawn. If
+    ``skip_finite`` is True, only DMFT theory curves are drawn.
     """
     if swept_col not in _SWEEP_VALUE_LABEL:
         raise ValueError(
@@ -407,9 +426,9 @@ def plot_pc_param_sweep_loss(
 
     group_cols = [c for c in _SWEEP_META_COLS if c != swept_col]
     frames = []
-    if theory_df is not None and len(theory_df):
+    if (not skip_theory) and theory_df is not None and len(theory_df):
         frames.append(theory_df[group_cols])
-    if finite_df is not None and len(finite_df):
+    if (not skip_finite) and finite_df is not None and len(finite_df):
         infer_df = finite_df[finite_df["infer_mode"] == "infer"]
         if len(infer_df):
             frames.append(infer_df[group_cols])
@@ -438,8 +457,10 @@ def plot_pc_param_sweep_loss(
         )
         g_finite = (
             _in_group(finite_df)
-            if finite_df is not None and len(finite_df)
-            else finite_df
+            if (not skip_finite)
+            and finite_df is not None
+            and len(finite_df)
+            else None
         )
 
         infer_finite = (
@@ -562,9 +583,15 @@ def plot_pc_param_sweep_loss(
 
         plt.xlabel("$t$")
         plt.ylabel("PC training loss (MSE)")
-        title = f"PC theory vs finite-size vs {axis_title}"
-        if skip_theory or not plot_theory:
+        if skip_finite or (
+            (infer_finite is None or not len(infer_finite))
+            and (closed_finite is None or not len(closed_finite))
+        ):
+            title = f"PC DMFT theory vs {axis_title}"
+        elif skip_theory or not plot_theory:
             title = f"PC finite-size vs {axis_title}"
+        else:
+            title = f"PC theory vs finite-size vs {axis_title}"
         if max_width is not None:
             title += f" ($N={max_width}$)"
         plt.title(title)
@@ -1043,62 +1070,71 @@ def plot_pc_bp_kernel_alignment(
 
 
 def plot_final_kernel_grid(
-    pc_kernels,
+    kernel_rows,
     plots_dir,
-    bp_kernels=None,
     gamma_0=None,
     n_hidden=None,
     activity_lr=None,
     n_infer_iters=None,
+    width=None,
+    filename="final_kernels_grid.png",
+    share_clim=False,
 ):
     """Grid of final-time sample-sample (``P x P``) feature kernels.
 
-    PC (``C^h`` at ``k=0``, last training step) fills the top row, one
-    panel per layer. When ``bp_kernels`` is given, the BP feature kernels
-    (``H``, last training step) fill a second row below for comparison.
+    ``kernel_rows`` is a list of ``(ylabel, kernels)`` pairs. Each
+    ``kernels`` is a sequence of ``P x P`` arrays, one per layer (column).
+    When ``share_clim`` is True, every panel uses the same colour limits.
     """
-    pc_kernels = _to_numpy(pc_kernels)
-    n_layers = len(pc_kernels)
-    _warn_if_nonfinite(
-        "pc final kernels", np.stack([np.asarray(k) for k in pc_kernels])
-    )
+    if not kernel_rows:
+        raise ValueError("kernel_rows must contain at least one row.")
 
-    show_bp = bp_kernels is not None
-    if show_bp:
-        bp_kernels = _to_numpy(bp_kernels)
-        if len(bp_kernels) != n_layers:
+    rows = []
+    n_layers = None
+    for label, kernels in kernel_rows:
+        kernels = _to_numpy(kernels)
+        if n_layers is None:
+            n_layers = len(kernels)
+        elif len(kernels) != n_layers:
             raise ValueError(
-                f"PC has {n_layers} layers but BP has {len(bp_kernels)}."
+                f"row '{label}' has {len(kernels)} layers but the first "
+                f"row has {n_layers}."
             )
         _warn_if_nonfinite(
-            "bp final kernels",
-            np.stack([np.asarray(k) for k in bp_kernels]),
+            f"{label} final kernels",
+            np.stack([np.asarray(k) for k in kernels]),
         )
+        rows.append((label, kernels))
 
-    n_rows = 2 if show_bp else 1
+    clim_kw = {}
+    if share_clim:
+        stacked = np.stack(
+            [np.asarray(k) for _, kernels in rows for k in kernels]
+        )
+        finite = stacked[np.isfinite(stacked)]
+        if finite.size:
+            clim_kw = dict(vmin=float(finite.min()), vmax=float(finite.max()))
+
+    n_rows = len(rows)
     fig, axes = plt.subplots(
         n_rows, n_layers, figsize=(2 * n_layers, 2 * n_rows), squeeze=False
     )
-    for l, kernel in enumerate(pc_kernels):
-        ax = axes[0, l]
-        ax.imshow(np.asarray(kernel), cmap="coolwarm")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_title(rf"$\ell = {l + 1}$")
-        if l == 0:
-            ax.set_ylabel("PC")
-    if show_bp:
-        for l, kernel in enumerate(bp_kernels):
-            ax = axes[1, l]
-            ax.imshow(np.asarray(kernel), cmap="coolwarm")
+    for r, (label, kernels) in enumerate(rows):
+        for l, kernel in enumerate(kernels):
+            ax = axes[r, l]
+            ax.imshow(np.asarray(kernel), cmap="coolwarm", **clim_kw)
             ax.set_xticks([])
             ax.set_yticks([])
+            if r == 0:
+                ax.set_title(rf"$\ell = {l + 1}$")
             if l == 0:
-                ax.set_ylabel("Backprop")
+                ax.set_ylabel(label)
 
     title = "Final feature kernels"
     if n_hidden is not None:
         title += f", $H={int(n_hidden)}$"
+    if width is not None:
+        title += f", $N={int(width)}$"
     if gamma_0 is not None:
         title += f", $\\gamma_0={gamma_0}$"
     if activity_lr is not None:
@@ -1115,7 +1151,7 @@ def plot_final_kernel_grid(
         activity_lr=activity_lr,
         n_infer_iters=n_infer_iters,
     )
-    save_path = os.path.join(out_dir, "final_kernels_grid.png")
+    save_path = os.path.join(out_dir, filename)
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Final feature kernel grid saved to {save_path}")

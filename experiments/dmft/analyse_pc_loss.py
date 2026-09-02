@@ -6,6 +6,14 @@ theory, finite BP simulations, and PC–BP gradient cosine similarities
 are omitted. Plots PC training loss across depth (``n_hiddens``), gamma
 (``gamma_0s``) and inference steps (``n_infer_iters``).
 
+Use ``--skip_theory`` to plot finite-size simulations only, or
+``--skip_finite`` to plot DMFT theory only.
+
+``--seed`` draws three independent RNG streams (dataset, weight init,
+DMFT Monte Carlo) so theory and finite-size always share the same
+``(X, y)`` without sharing PRNG keys. Finite-size trials only vary
+Gaussian weight initialisation.
+
 For finite-width vs theory kernel alignment plots against width, see
 ``analyse_convergence.py`` instead.
 
@@ -194,7 +202,15 @@ if __name__ == "__main__":
         default=False,
         help=(
             "Skip PC DMFT theory (PC matrices are K*T*P dimensional "
-            "and can be costly)."
+            "and can be costly). Plots finite-size simulations only."
+        ),
+    )
+    parser.add_argument(
+        "--skip_finite",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip finite-width PC simulations. Plots DMFT theory only."
         ),
     )
     parser.add_argument(
@@ -245,6 +261,8 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+    if args.skip_theory and args.skip_finite:
+        parser.error("Cannot set both --skip_theory and --skip_finite.")
 
     # PC DMFT inverts (K*T*P) matrices; float64 helps stability.
     # Also needed for large width & depth computation of s(theta).
@@ -265,48 +283,59 @@ if __name__ == "__main__":
     max_width = max(args.widths)
     run_widths = list(args.widths) if not overlay_any else [max_width]
 
+    # Three independent children of --seed: dataset, weight init, DMFT Monte
+    # Carlo. Previously theory used PRNGKey(seed) itself, which is the parent
+    # of the data and init keys — JAX forbids reusing a key, so the DMFT
+    # Gaussians were correlated with the samples.
+    data_key, model_parent, theory_mc_key = jax.random.split(
+        jax.random.PRNGKey(args.seed), 3
+    )
+
+    if args.dataset == "toy":
+        X, y = create_toy_dataset(
+            key=data_key, D=args.input_dim, P=args.n_samples
+        )
+        input_dim = args.input_dim
+        output_dim = 1
+    elif args.dataset == "tiny-CIFAR10":
+        input_dim = CIFAR_GRAY_DIM
+        X, y = create_tiny_cifar10_dataset(
+            key=data_key, D=input_dim, P=args.n_samples
+        )
+        output_dim = 1
+        print(f"Input dim: {input_dim}, Output dim: {output_dim}")
+    else:
+        from torch import Generator as TorchGenerator
+
+        loader_gen = TorchGenerator()
+        loader_gen.manual_seed(int(np.asarray(data_key)[0]) & 0x7FFFFFFF)
+        train_loader, _ = get_dataloaders(
+            args.dataset, args.n_samples, generator=loader_gen
+        )
+        img_batch, label_batch = next(iter(train_loader))
+
+        input_dim = img_batch.shape[1]
+        output_dim = label_batch.shape[1]
+        print(f"Input dim: {input_dim}, Output dim: {output_dim}")
+
+        X = img_batch.numpy().T
+        y = label_batch.numpy()
+
+    Kx = jnp.asarray(X.T @ X / input_dim, dtype=jnp.float64)
+    X_input = jnp.asarray(X.T, dtype=jnp.float64)
+    Y_target = y[:, None] if y.ndim == 1 else y
+    Y_target = jnp.asarray(Y_target, dtype=jnp.float64)
+    loss_id = (
+        "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
+    )
+    theory_cache = {}
+
     for seed in range(args.seed, args.seed + args.n_seeds):
         print(f"\nRunning experiment for seed: {seed}")
 
-        # --- Set Seed ---
         set_seed(seed)
-        key = jax.random.PRNGKey(seed)
-        data_key, model_key = jax.random.split(key)
+        model_key = jax.random.fold_in(model_parent, int(seed))
 
-        # --- Setup Dataset ---
-        if args.dataset == "toy":
-            X, y = create_toy_dataset(
-                key=data_key, D=args.input_dim, P=args.n_samples
-            )
-            input_dim = args.input_dim
-            output_dim = 1
-        elif args.dataset == "tiny-CIFAR10":
-            input_dim = CIFAR_GRAY_DIM
-            X, y = create_tiny_cifar10_dataset(
-                key=data_key, D=input_dim, P=args.n_samples
-            )
-            output_dim = 1
-            print(f"Input dim: {input_dim}, Output dim: {output_dim}")
-        else:
-            train_loader, _ = get_dataloaders(args.dataset, args.n_samples)
-            img_batch, label_batch = next(iter(train_loader))
-
-            input_dim = img_batch.shape[1]
-            output_dim = label_batch.shape[1]
-            print(f"Input dim: {input_dim}, Output dim: {output_dim}")
-
-            X = img_batch.numpy().T
-            y = label_batch.numpy()
-
-        Kx = X.T @ X / input_dim
-
-        # In this dataset, we treat the whole P samples as one batch, matching
-        # the convention assumed by the (whole-batch) DMFT theory.
-        X_input = X.T  # Shape (P, D)
-        Y_target = y[:, None] if y.ndim == 1 else y
-        loss_id = (
-            "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
-        )
         theory_records = []
         finite_records = []
 
@@ -333,83 +362,95 @@ if __name__ == "__main__":
                             for K_inf in args.n_infer_iters:
                                 print(f"\n\t\t\t\t\t\tn_infer_iters = {K_inf}")
 
-                                # --- Calculate theory (PC) ---
+                                # --- Calculate theory (PC), cached across seeds ---
                                 pc_dmft_loss = None
                                 T_train = args.n_train_iters
                                 P = args.n_samples
                                 if not args.skip_theory:
-                                    n_pc = K_inf * T_train * P
-                                    if use_nonlin_theory:
-                                        print(
-                                            "\t\t\t\t\tCalculating nonlinear PC Theory "
-                                            f"(act_fn={args.act_fn}, "
-                                            f"matrix size n = K*T*P = {n_pc})...\n"
-                                        )
-                                        (
-                                            _all_Ch,
-                                            _all_Cdelta,
-                                            _all_Rh,
-                                            _all_Rdelta,
-                                            _C_delta_top,
-                                            pc_dmft_loss,
-                                            _mean_delta_top,
-                                            pc_diagnostics,
-                                        ) = solve_pc_kernels_nonlin(
-                                            Kx=jnp.asarray(Kx, dtype=jnp.float64),
-                                            y=y,
-                                            depth=n_hidden,
-                                            eta=args.param_lr_pc,
-                                            gamma=gamma_0,
-                                            beta_h=activity_lr,
-                                            hidden_energy_scaling=n_hidden + 1,
-                                            num_training_steps=T_train,
-                                            num_inference_steps=K_inf,
-                                            num_fixed_point_steps=args.n_fixed_point_steps,
-                                            num_mc_samples=args.num_mc_samples,
-                                            num_jacobian_samples=args.num_jacobian_samples,
-                                            jacobian_batch_size=args.jacobian_batch_size,
-                                            damping=args.pc_damping,
-                                            nonlinearity=args.act_fn,
-                                            beta=args.nonlin_beta,
-                                            tolerance=args.pc_tolerance,
-                                            seed=seed,
-                                        )
-                                    else:
-                                        print(
-                                            "\t\t\t\t\tCalculating PC Theory "
-                                            f"(matrix size n = K*T*P = {n_pc})...\n"
-                                        )
-                                        (
-                                            _all_Ch,
-                                            _all_Cdelta,
-                                            _all_Rh,
-                                            _all_Rdelta,
-                                            _C_delta_top,
-                                            pc_dmft_loss,
-                                            _mean_delta_top,
-                                            pc_diagnostics,
-                                        ) = solve_pc_kernels(
-                                            Kx=jnp.asarray(Kx, dtype=jnp.float64),
-                                            y=y,
-                                            depth=n_hidden,
-                                            eta=args.param_lr_pc,
-                                            gamma=gamma_0,
-                                            beta_h=activity_lr,
-                                            hidden_energy_scaling=n_hidden + 1,
-                                            num_training_steps=T_train,
-                                            num_inference_steps=K_inf,
-                                            num_fixed_point_steps=args.n_fixed_point_steps,
-                                            damping=args.pc_damping,
-                                            tolerance=args.pc_tolerance,
-                                            backend=args.pc_backend,
-                                        )
-                                    print(
-                                        "\t\t\t\t\tPC fixed-point residual = "
-                                        f"{float(pc_diagnostics['fixed_point_residual']):.3e}, "
-                                        "equation residual = "
-                                        f"{float(pc_diagnostics['equation_residual']):.3e} "
-                                        f"after {pc_diagnostics['iterations']} iters\n"
+                                    theory_key = (
+                                        n_hidden,
+                                        bool(use_skips),
+                                        gamma_0,
+                                        param_type,
+                                        activity_lr,
+                                        K_inf,
                                     )
+                                    if theory_key in theory_cache:
+                                        pc_dmft_loss = theory_cache[theory_key]
+                                    else:
+                                        n_pc = K_inf * T_train * P
+                                        if use_nonlin_theory:
+                                            print(
+                                                "\t\t\t\t\tCalculating nonlinear PC Theory "
+                                                f"(act_fn={args.act_fn}, "
+                                                f"matrix size n = K*T*P = {n_pc})...\n"
+                                            )
+                                            (
+                                                _all_Ch,
+                                                _all_Cdelta,
+                                                _all_Rh,
+                                                _all_Rdelta,
+                                                _C_delta_top,
+                                                pc_dmft_loss,
+                                                _mean_delta_top,
+                                                pc_diagnostics,
+                                            ) = solve_pc_kernels_nonlin(
+                                                Kx=Kx,
+                                                y=Y_target,
+                                                depth=n_hidden,
+                                                eta=args.param_lr_pc,
+                                                gamma=gamma_0,
+                                                beta_h=activity_lr,
+                                                hidden_energy_scaling=n_hidden + 1,
+                                                num_training_steps=T_train,
+                                                num_inference_steps=K_inf,
+                                                num_fixed_point_steps=args.n_fixed_point_steps,
+                                                num_mc_samples=args.num_mc_samples,
+                                                num_jacobian_samples=args.num_jacobian_samples,
+                                                jacobian_batch_size=args.jacobian_batch_size,
+                                                damping=args.pc_damping,
+                                                nonlinearity=args.act_fn,
+                                                beta=args.nonlin_beta,
+                                                tolerance=args.pc_tolerance,
+                                                key=theory_mc_key,
+                                            )
+                                        else:
+                                            print(
+                                                "\t\t\t\t\tCalculating PC Theory "
+                                                f"(matrix size n = K*T*P = {n_pc})...\n"
+                                            )
+                                            (
+                                                _all_Ch,
+                                                _all_Cdelta,
+                                                _all_Rh,
+                                                _all_Rdelta,
+                                                _C_delta_top,
+                                                pc_dmft_loss,
+                                                _mean_delta_top,
+                                                pc_diagnostics,
+                                            ) = solve_pc_kernels(
+                                                Kx=Kx,
+                                                y=Y_target,
+                                                depth=n_hidden,
+                                                eta=args.param_lr_pc,
+                                                gamma=gamma_0,
+                                                beta_h=activity_lr,
+                                                hidden_energy_scaling=n_hidden + 1,
+                                                num_training_steps=T_train,
+                                                num_inference_steps=K_inf,
+                                                num_fixed_point_steps=args.n_fixed_point_steps,
+                                                damping=args.pc_damping,
+                                                tolerance=args.pc_tolerance,
+                                                backend=args.pc_backend,
+                                            )
+                                        print(
+                                            "\t\t\t\t\tPC fixed-point residual = "
+                                            f"{float(pc_diagnostics['fixed_point_residual']):.3e}, "
+                                            "equation residual = "
+                                            f"{float(pc_diagnostics['equation_residual']):.3e} "
+                                            f"after {pc_diagnostics['iterations']} iters\n"
+                                        )
+                                        theory_cache[theory_key] = pc_dmft_loss
 
                                 sweep_meta = dict(
                                     n_hidden=n_hidden,
@@ -427,47 +468,50 @@ if __name__ == "__main__":
                                     )
 
                                 # --- Finite-size PC simulation (infer) ---
-                                print(
-                                    "\t\t\t\t\tRunning finite-size PC simulation "
-                                    f"for widths {run_widths}...\n"
-                                )
-                                finite_pc_records = []
-                                for width in run_widths:
+                                if not args.skip_finite:
                                     print(
-                                        "\t\t\t\t\tNumerical PC simulation "
-                                        f"for width N = {width}"
+                                        "\t\t\t\t\tRunning finite-size PC "
+                                        f"simulation for widths {run_widths}...\n"
                                     )
-                                    losses = _train_finite_pc(
-                                        width_key_map[width],
-                                        results_dir=args.results_dir,
-                                        input_dim=input_dim,
-                                        output_dim=output_dim,
-                                        n_samples=args.n_samples,
-                                        n_hidden=n_hidden,
-                                        use_skips=use_skips,
-                                        act_fn=args.act_fn,
-                                        param_type=param_type,
-                                        param_lr=args.param_lr_pc,
-                                        gamma_0=gamma_0,
-                                        param_optim_id=args.param_optim,
-                                        n_train_iters=T_train,
-                                        infer_mode="optim",
-                                        n_infer_iters=K_inf,
-                                        activity_lr=activity_lr,
-                                        width=width,
-                                        loss_id=loss_id,
-                                        seed=seed,
-                                        X_input=X_input,
-                                        Y_target=Y_target,
-                                    )
-                                    recs = _loss_records(
-                                        losses,
-                                        width=width,
-                                        infer_mode="infer",
-                                        **sweep_meta,
-                                    )
-                                    finite_pc_records.extend(recs)
-                                    finite_records.extend(recs)
+                                    finite_pc_records = []
+                                    for width in run_widths:
+                                        print(
+                                            "\t\t\t\t\tNumerical PC simulation "
+                                            f"for width N = {width}"
+                                        )
+                                        losses = _train_finite_pc(
+                                            width_key_map[width],
+                                            results_dir=args.results_dir,
+                                            input_dim=input_dim,
+                                            output_dim=output_dim,
+                                            n_samples=args.n_samples,
+                                            n_hidden=n_hidden,
+                                            use_skips=use_skips,
+                                            act_fn=args.act_fn,
+                                            param_type=param_type,
+                                            param_lr=args.param_lr_pc,
+                                            gamma_0=gamma_0,
+                                            param_optim_id=args.param_optim,
+                                            n_train_iters=T_train,
+                                            infer_mode="optim",
+                                            n_infer_iters=K_inf,
+                                            activity_lr=activity_lr,
+                                            width=width,
+                                            loss_id=loss_id,
+                                            seed=seed,
+                                            X_input=X_input,
+                                            Y_target=Y_target,
+                                        )
+                                        recs = _loss_records(
+                                            losses,
+                                            width=width,
+                                            infer_mode="infer",
+                                            **sweep_meta,
+                                        )
+                                        finite_pc_records.extend(recs)
+                                        finite_records.extend(recs)
+                                else:
+                                    finite_pc_records = []
 
                                 if not overlay_any:
                                     finite_pc_df = pd.DataFrame(
@@ -490,10 +534,14 @@ if __name__ == "__main__":
                                         n_infer_iters=K_inf,
                                         update_mode="infer",
                                         skip_theory=args.skip_theory,
+                                        skip_finite=args.skip_finite,
                                     )
 
                                     # Closed-form equilib grads (linear nets).
-                                    if args.act_fn == "linear":
+                                    if (
+                                        not args.skip_finite
+                                        and args.act_fn == "linear"
+                                    ):
                                         print(
                                             "\t\t\t\t\tRunning finite-size PC "
                                             "simulation (theory update) for "
@@ -553,10 +601,12 @@ if __name__ == "__main__":
                                             n_infer_iters=K_inf,
                                             update_mode="theory",
                                             skip_theory=args.skip_theory,
+                                            skip_finite=args.skip_finite,
                                         )
 
                             if (
                                 overlay_any
+                                and (not args.skip_finite)
                                 and args.act_fn == "linear"
                                 and (
                                     args.plot_closed_form
@@ -620,6 +670,7 @@ if __name__ == "__main__":
                 finite_df=finite_df,
                 plots_dir=plots_root,
                 skip_theory=args.skip_theory,
+                skip_finite=args.skip_finite,
             )
             if overlay_n_hiddens:
                 plot_pc_param_sweep_loss(
@@ -671,10 +722,12 @@ if __name__ == "__main__":
 #########################################
 
 # Across depth
-# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 1 2 3  --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 1 2 3  --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
 
 # Across gamma
-# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 3 --widths 4096 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 3 --widths 4096 --gamma_0s 0.1 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
 
 # Across K
 # CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 10 --n_hiddens 3 --widths 4096 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 10 15 20 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000 --skip_theory
+
+# CUDA_VISIBLE_DEVICES=1 python analyse_pc_loss.py --n_samples 8 --n_hiddens 3 --widths 4096 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
