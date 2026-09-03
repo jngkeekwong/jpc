@@ -16,9 +16,9 @@ Kernel / width figures:
 - ``both``: solve DMFT once, then run the ``kernels`` grid (largest
   width, first seed) and the ``width`` alignment sweep.
 - ``auto``: ``kernels`` if a single ``--widths`` value is given, else
-  ``both``. Extra ``K`` values (when several ``--n_infer_iters`` are
-  given) do not get kernel figures in ``auto``; pass ``kernels`` /
-  ``width`` / ``both`` to request them.
+  ``both``. Several ``--n_infer_iters`` always add a stacked ``K``-sweep
+  kernel grid and a per-layer displacement overlay (see loss figures);
+  they do not add extra per-``K`` kernel grids.
 
 Loss figures:
 - Single ``H``, ``gamma_0``, and ``K``: theory vs finite-size loss
@@ -26,14 +26,17 @@ Loss figures:
 - Several ``--n_hiddens``: overlay loss vs depth at the largest width.
 - Several ``--gamma_0s``: overlay loss vs ``gamma`` at the largest width.
 - Several ``--n_infer_iters``: overlay loss vs ``K`` at the largest
-  width. DMFT is solved and plotted only for the smallest ``K`` unless
-  kernel figures for the other ``K`` are requested (explicit
-  ``--plot_mode``). Linear nets also get one finite-size closed-form
-  curve (independent of ``K``).
+  width, plus a stacked final-kernel grid (DMFT at the smallest ``K``,
+  then finite-size infer for increasing ``K``, then closed-form in the
+  linear case) and a per-layer displacement overlay (initial vs final
+  ``C^h``). DMFT is solved and plotted only for the smallest ``K``.
+  Linear nets also get one finite-size closed-form curve (independent
+  of ``K``).
 
-``--skip_theory`` skips DMFT on the kernel-grid-only path and on loss
-plots; it has no effect when the width-alignment path runs (theory is
-required). ``--skip_finite`` skips finite-width simulations (theory
+``--skip_theory`` skips DMFT on the kernel-grid-only path, on loss
+plots, and on the ``K``-sweep kernel grid / displacement (no DMFT row
+or curve). It has no effect when the width-alignment path runs (theory
+is required). ``--skip_finite`` skips finite-width simulations (theory
 loss only; kernel figures are dropped).
 
 Theory is solved once per hyperparameter combination and reused across
@@ -72,6 +75,7 @@ from experiments.dmft.utils import (
     cosine_similarity,
     empirical_pc_kernel,
     final_time_pc_kernel,
+    pc_hidden_preactivations_and_errors,
 )
 from theory_pc_utils import solve_pc_kernels
 from theory_pc_nonlin_utils import solve_pc_kernels_nonlin, get_nonlinearity
@@ -80,6 +84,7 @@ from plot_dmft_results import (
     plot_pc_param_sweep_loss,
     plot_pc_kernel_width_alignment,
     plot_final_kernel_grid,
+    plot_pc_k_sweep_displacement,
 )
 
 
@@ -112,7 +117,8 @@ def _train_finite_pc(
 
     Returns the loss trajectory and, when ``collect_fields`` is True,
     hidden ``h`` at ``k=0`` / ``Δ`` at the last inference step
-    ``k=n_infer_iters`` of the trained network (else ``None``).
+    ``k=n_infer_iters`` of the trained network, plus untrained
+    feedforward ``h_init`` (else ``None``).
     """
     save_dir = setup_pc_experiment(
         results_dir=results_dir,
@@ -143,6 +149,27 @@ def _train_finite_pc(
         use_bias=False,
         param_type=param_type,
     )
+    skip_model = jpc.make_skip_model(len(model)) if use_skips else None
+    h_init = None
+    if collect_fields:
+        init_activities = jpc.init_activities_with_ffwd(
+            model=model,
+            input=X_input,
+            skip_model=skip_model,
+            param_type=param_type,
+            gamma=gamma_0,
+        )
+        hs_init, _ = pc_hidden_preactivations_and_errors(
+            model=model,
+            skip_model=skip_model,
+            activities=init_activities,
+            x=X_input,
+            param_type=param_type,
+            gamma=gamma_0,
+        )
+        h_init = np.stack(
+            [np.asarray(h, dtype=np.float32) for h in hs_init], axis=0
+        )
     _, model, skip_model = train_pcn(
         model=model,
         use_skips=use_skips,
@@ -176,6 +203,7 @@ def _train_finite_pc(
         loss_id=loss_id,
         n_infer_iters=n_infer_iters,
     )
+    fields["h_init"] = h_init
     return losses, fields
 
 
@@ -255,28 +283,158 @@ def _kernel_align_records(
     return records
 
 
-def _final_feature_kernels(fields, phi_fn):
+def _feature_kernels_from_h(h, phi_fn):
     """Empirical ``C^h`` at ``k=0`` for every hidden layer (readout omitted)."""
-    h_final = fields["h"]
     kernels = []
-    for l in range(h_final.shape[0]):
-        phi_l = np.asarray(phi_fn(jnp.asarray(h_final[l])))
+    for l in range(h.shape[0]):
+        phi_l = np.asarray(phi_fn(jnp.asarray(h[l])))
         kernels.append(empirical_pc_kernel(phi_l))
     return kernels
 
 
-def _final_dmft_feature_kernels(
-    all_Ch, num_inference_steps, num_training_steps, num_samples
+def _final_feature_kernels(fields, phi_fn):
+    """Empirical ``C^h`` at ``k=0`` of the trained network."""
+    return _feature_kernels_from_h(fields["h"], phi_fn)
+
+
+def _init_feature_kernels(fields, phi_fn):
+    """Empirical ``C^h`` from the untrained feedforward pass."""
+    return _feature_kernels_from_h(fields["h_init"], phi_fn)
+
+
+def _kernel_displacement_records(init_kernels, final_kernels, **meta):
+    """Per-layer cosine similarity of initial vs final feature kernels."""
+    if len(init_kernels) != len(final_kernels):
+        raise ValueError(
+            "init/final kernel counts differ: "
+            f"{len(init_kernels)} vs {len(final_kernels)}"
+        )
+    records = []
+    for l, (C0, CT) in enumerate(zip(init_kernels, final_kernels)):
+        records.append(
+            {
+                **meta,
+                "layer": l,
+                "displacement": float(
+                    cosine_similarity(C0, CT, eps=1e-30)
+                ),
+            }
+        )
+    return records
+
+
+def _dmft_feature_kernels(
+    all_Ch, num_inference_steps, num_training_steps, num_samples, t=-1
 ):
-    """DMFT ``C^h`` sample-sample block at ``k=0`` and last training step."""
+    """DMFT ``C^h`` sample-sample block at ``k=0`` and training time ``t``."""
     slice_kw = dict(
         num_inference_steps=num_inference_steps,
         num_training_steps=num_training_steps,
         num_samples=num_samples,
     )
     return [
-        final_time_pc_kernel(Ch_l, k=0, t=-1, **slice_kw) for Ch_l in all_Ch
+        final_time_pc_kernel(Ch_l, k=0, t=t, **slice_kw) for Ch_l in all_Ch
     ]
+
+
+def _final_dmft_feature_kernels(
+    all_Ch, num_inference_steps, num_training_steps, num_samples
+):
+    """DMFT ``C^h`` sample-sample block at ``k=0`` and last training step."""
+    return _dmft_feature_kernels(
+        all_Ch,
+        num_inference_steps,
+        num_training_steps,
+        num_samples,
+        t=-1,
+    )
+
+
+def _plot_k_sweep_kernels_and_displacement(
+    infer_final,
+    infer_init,
+    dmft_final,
+    dmft_init,
+    dmft_K,
+    fields_cf,
+    phi_fn,
+    plots_dir,
+    gamma_0,
+    n_hidden,
+    activity_lr,
+    width,
+    use_nonlin_theory,
+    skip_closed_form,
+):
+    """Stacked ``K``-sweep kernel grid and per-layer displacement overlay."""
+    kernel_rows = []
+    if dmft_final is not None:
+        kernel_rows.append(
+            (rf"DMFT ($K={int(dmft_K)}$)", dmft_final)
+        )
+    for K in sorted(infer_final):
+        kernel_rows.append((rf"$K={int(K)}$", infer_final[K]))
+
+    cf_final = None
+    cf_init = None
+    if (
+        fields_cf is not None
+        and (not use_nonlin_theory)
+        and (not skip_closed_form)
+    ):
+        cf_final = _final_feature_kernels(fields_cf, phi_fn)
+        cf_init = _init_feature_kernels(fields_cf, phi_fn)
+        kernel_rows.append(("Closed-form", cf_final))
+
+    if kernel_rows:
+        plot_final_kernel_grid(
+            kernel_rows,
+            plots_dir=plots_dir,
+            gamma_0=gamma_0,
+            n_hidden=n_hidden,
+            activity_lr=activity_lr,
+            width=width,
+            filename="final_pc_kernels_grid.png",
+            share_clim=True,
+        )
+
+    disp_records = []
+    if dmft_init is not None and dmft_final is not None:
+        disp_records.extend(
+            _kernel_displacement_records(
+                dmft_init,
+                dmft_final,
+                kind="dmft",
+                n_infer_iters=int(dmft_K),
+            )
+        )
+    for K in sorted(infer_init):
+        disp_records.extend(
+            _kernel_displacement_records(
+                infer_init[K],
+                infer_final[K],
+                kind="infer",
+                n_infer_iters=int(K),
+            )
+        )
+    if cf_init is not None and cf_final is not None:
+        disp_records.extend(
+            _kernel_displacement_records(
+                cf_init,
+                cf_final,
+                kind="closed_form",
+                n_infer_iters=int(dmft_K) if dmft_K is not None else 0,
+            )
+        )
+    if disp_records:
+        plot_pc_k_sweep_displacement(
+            pd.DataFrame(disp_records),
+            plots_dir=plots_dir,
+            n_hidden=n_hidden,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+            width=width,
+        )
 
 
 if __name__ == "__main__":
@@ -385,9 +543,10 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help=(
-            "Skip PC DMFT theory on loss plots and on the kernel-grid-only "
-            "path. Has no effect when the width-alignment path also runs "
-            "(theory is required)."
+            "Skip PC DMFT theory on loss plots, on the kernel-grid-only "
+            "path, and on the K-sweep kernel grid / displacement (no "
+            "DMFT row or curve). Has no effect when the width-alignment "
+            "path also runs (theory is required)."
         ),
     )
     parser.add_argument(
@@ -565,19 +724,37 @@ if __name__ == "__main__":
                         for activity_lr in args.activity_lrs:
                             print(f"\n\t\t\t\t\tactivity_lr = {activity_lr}")
 
+                            k_sweep_infer_final = {}
+                            k_sweep_infer_init = {}
+                            k_sweep_dmft_final = None
+                            k_sweep_dmft_init = None
+                            k_sweep_dmft_K = None
+
                             for K_inf in args.n_infer_iters:
                                 print(f"\n\t\t\t\t\t\tn_infer_iters = {K_inf}")
 
                                 T_train = args.n_train_iters
                                 P = args.n_samples
-                                # auto: kernel figures and DMFT only for
-                                # the smallest K unless --plot_mode is an
-                                # explicit kernels / width / both request.
-                                kernels_this_K = plot_kernels and (
-                                    explicit_kernel_mode or K_inf == min_K
+                                # Per-K kernel grids are skipped when
+                                # overlaying K; a stacked grid is drawn
+                                # after this loop instead. Width alignment
+                                # and DMFT still use only the smallest K
+                                # unless --plot_mode is explicit.
+                                kernels_this_K = (
+                                    plot_kernels
+                                    and (not overlay_n_infer_iters)
+                                    and (
+                                        explicit_kernel_mode
+                                        or K_inf == min_K
+                                    )
                                 )
                                 width_this_K = plot_width and (
                                     explicit_kernel_mode or K_inf == min_K
+                                )
+                                k_sweep_this = (
+                                    overlay_n_infer_iters
+                                    and (not args.skip_finite)
+                                    and seed == kernel_grid_seed
                                 )
                                 solve_theory = False
                                 if width_this_K:
@@ -701,6 +878,32 @@ if __name__ == "__main__":
                                             pc_dmft_loss, **sweep_meta
                                         )
                                     )
+                                if (
+                                    overlay_n_infer_iters
+                                    and seed == kernel_grid_seed
+                                    and K_inf == min_K
+                                    and all_Ch is not None
+                                    and (not args.skip_theory)
+                                ):
+                                    k_sweep_dmft_K = K_inf
+                                    k_sweep_dmft_final = (
+                                        _dmft_feature_kernels(
+                                            all_Ch,
+                                            num_inference_steps=K_inf,
+                                            num_training_steps=T_train,
+                                            num_samples=P,
+                                            t=-1,
+                                        )
+                                    )
+                                    k_sweep_dmft_init = (
+                                        _dmft_feature_kernels(
+                                            all_Ch,
+                                            num_inference_steps=K_inf,
+                                            num_training_steps=T_train,
+                                            num_samples=P,
+                                            t=0,
+                                        )
+                                    )
 
                                 if width_this_K:
                                     finite_widths = run_widths
@@ -708,7 +911,11 @@ if __name__ == "__main__":
                                     finite_widths = [kernel_plot_width]
                                 else:
                                     finite_widths = run_widths
-                                collect_fields = kernels_this_K or width_this_K
+                                collect_fields = (
+                                    kernels_this_K
+                                    or width_this_K
+                                    or k_sweep_this
+                                )
 
                                 # --- Finite-size PC simulation (infer) ---
                                 finite_pc_records = []
@@ -781,6 +988,21 @@ if __name__ == "__main__":
                                         ):
                                             infer_feature_kernels = (
                                                 _final_feature_kernels(
+                                                    fields, phi_fn
+                                                )
+                                            )
+                                        if (
+                                            k_sweep_this
+                                            and width == kernel_plot_width
+                                            and fields is not None
+                                        ):
+                                            k_sweep_infer_final[K_inf] = (
+                                                _final_feature_kernels(
+                                                    fields, phi_fn
+                                                )
+                                            )
+                                            k_sweep_infer_init[K_inf] = (
+                                                _init_feature_kernels(
                                                     fields, phi_fn
                                                 )
                                             )
@@ -900,7 +1122,11 @@ if __name__ == "__main__":
                                     "simulation (closed-form) for "
                                     f"width N = {kernel_plot_width}...\n"
                                 )
-                                closed_losses, _ = _train_finite_pc(
+                                collect_cf = (
+                                    seed == kernel_grid_seed
+                                    and (not args.skip_closed_form)
+                                )
+                                closed_losses, fields_cf = _train_finite_pc(
                                     width_key_map[kernel_plot_width],
                                     results_dir=args.results_dir,
                                     input_dim=input_dim,
@@ -922,7 +1148,7 @@ if __name__ == "__main__":
                                     seed=seed,
                                     X_input=X_input,
                                     Y_target=Y_target,
-                                    collect_fields=False,
+                                    collect_fields=collect_cf,
                                 )
                                 finite_records.extend(
                                     _loss_records(
@@ -937,6 +1163,34 @@ if __name__ == "__main__":
                                         infer_mode="closed_form",
                                     )
                                 )
+                            else:
+                                fields_cf = None
+
+                            if (
+                                overlay_n_infer_iters
+                                and seed == kernel_grid_seed
+                                and (not args.skip_finite)
+                            ):
+                                _plot_k_sweep_kernels_and_displacement(
+                                    infer_final=k_sweep_infer_final,
+                                    infer_init=k_sweep_infer_init,
+                                    dmft_final=k_sweep_dmft_final,
+                                    dmft_init=k_sweep_dmft_init,
+                                    dmft_K=k_sweep_dmft_K,
+                                    fields_cf=fields_cf,
+                                    phi_fn=phi_fn,
+                                    plots_dir=os.path.join(
+                                        args.results_dir, "plots"
+                                    ),
+                                    gamma_0=gamma_0,
+                                    n_hidden=n_hidden,
+                                    activity_lr=activity_lr,
+                                    width=kernel_plot_width,
+                                    use_nonlin_theory=use_nonlin_theory,
+                                    skip_closed_form=args.skip_closed_form,
+                                )
+                            if fields_cf is not None:
+                                del fields_cf
 
         if overlay_any:
             theory_df = pd.DataFrame(theory_records)
@@ -1016,7 +1270,7 @@ if __name__ == "__main__":
 # Across gamma
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
 
-# Across K (DMFT only for smallest K; closed-form finite-size overlay)
+# Across K (DMFT only for smallest K; stacked kernel grid + displacement)
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
 
 # Across widths (convergence of kernels + plot final kernels)
@@ -1035,7 +1289,7 @@ if __name__ == "__main__":
 # Across gamma
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
 
-# Across K (DMFT only for smallest K)
+# Across K (DMFT only for smallest K; stacked kernel grid + displacement)
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 50 100 500 1000 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
 
 # Across widths (convergence of kernels + plot final kernels)

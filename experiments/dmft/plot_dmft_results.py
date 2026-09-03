@@ -997,6 +997,125 @@ def plot_kernel_displacement(
     return save_path
 
 
+def plot_pc_k_sweep_displacement(
+    displacement_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    width=None,
+):
+    """Overlay per-layer feature-kernel displacement for a ``K`` sweep.
+
+    ``displacement_df`` must have columns ``layer``, ``displacement``,
+    ``kind`` (``"dmft"``, ``"infer"``, or ``"closed_form"``), and
+    ``n_infer_iters``. One curve per series: DMFT (smallest ``K``,
+    dashed), finite-size infer (solid, increasing ``K``), and
+    closed-form (linear case, dash-dot).
+    """
+    if displacement_df is None or len(displacement_df) == 0:
+        print("No K-sweep kernel displacement records to plot.")
+        return None
+
+    plt.figure(figsize=(8, 6))
+    infer_ks = sorted(
+        {
+            int(k)
+            for k in displacement_df.loc[
+                displacement_df["kind"] == "infer", "n_infer_iters"
+            ].dropna().unique()
+        }
+    )
+    cmap = plt.get_cmap("viridis")
+    k_colors = {
+        k: cmap(i / max(1, len(infer_ks) - 1))
+        for i, k in enumerate(infer_ks)
+    }
+
+    dmft_sub = displacement_df[displacement_df["kind"] == "dmft"]
+    if len(dmft_sub):
+        dmft_k = int(dmft_sub["n_infer_iters"].iloc[0])
+        sub = dmft_sub.sort_values("layer")
+        layers = np.asarray(sub["layer"], dtype=float) + 1
+        values = np.asarray(sub["displacement"], dtype=float)
+        _warn_if_nonfinite(f"dmft displacement (K={dmft_k})", values)
+        plt.plot(
+            layers,
+            values,
+            color=k_colors.get(dmft_k, "black"),
+            linestyle="--",
+            linewidth=2.0,
+            marker="o",
+            label=rf"theory, $K={dmft_k}$",
+        )
+
+    for k in infer_ks:
+        sub = displacement_df[
+            (displacement_df["kind"] == "infer")
+            & (displacement_df["n_infer_iters"].astype(int) == int(k))
+        ].sort_values("layer")
+        if not len(sub):
+            continue
+        layers = np.asarray(sub["layer"], dtype=float) + 1
+        values = np.asarray(sub["displacement"], dtype=float)
+        _warn_if_nonfinite(f"infer displacement (K={k})", values)
+        plt.plot(
+            layers,
+            values,
+            color=k_colors[k],
+            linestyle="-",
+            marker="o",
+            markersize=4,
+            alpha=0.85,
+            label=rf"finite infer, $K={k}$",
+        )
+
+    cf_sub = displacement_df[displacement_df["kind"] == "closed_form"]
+    if len(cf_sub):
+        sub = cf_sub.sort_values("layer")
+        layers = np.asarray(sub["layer"], dtype=float) + 1
+        values = np.asarray(sub["displacement"], dtype=float)
+        _warn_if_nonfinite("closed-form displacement", values)
+        plt.plot(
+            layers,
+            values,
+            color="black",
+            linestyle="-.",
+            linewidth=2.2,
+            marker="s",
+            markersize=4,
+            label="finite closed-form",
+        )
+
+    plt.xlabel(r"layer $\ell$")
+    plt.ylabel(r"$\cos(C^{\cdot,\ell}_{t=0}, C^{\cdot,\ell}_{t=T})$")
+    title = "Feature-kernel displacement across training"
+    if n_hidden is not None:
+        title += f", $H={int(n_hidden)}$"
+    if width is not None:
+        title += f", $N={int(width)}$"
+    if gamma_0 is not None:
+        title += f", $\\gamma_0={gamma_0}$"
+    if activity_lr is not None:
+        title += f", activity lr$={activity_lr}$"
+    plt.title(title)
+    plt.ylim(-1.05, 1.05)
+    plt.legend(fontsize=8)
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+    )
+    save_path = os.path.join(out_dir, "kernel_displacement_vs_layer.png")
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"K-sweep kernel displacement plot saved to {save_path}")
+    return save_path
+
+
 def plot_pc_bp_kernel_alignment(
     alignment_df,
     plots_dir,
