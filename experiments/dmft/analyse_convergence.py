@@ -4,6 +4,11 @@ Kernel / width figures are selected by ``--plot_mode`` (default ``auto``).
 Loss curves are always produced, including overlays when ``--n_hiddens``,
 ``--gamma_0s``, or ``--n_infer_iters`` contain multiple values.
 
+Feature kernels: linear nets compare theory/finite ``C^h``; nonlinear
+nets compare theory ``C^phi`` (first return of
+``solve_pc_kernels_nonlin``, often stored as ``all_Ch``) against finite
+``phi(h)``. Plot labels follow this convention.
+
 Kernel / width figures:
 - ``kernels``: final feature-kernel grid (closed-form / infer / DMFT;
   closed-form omitted for nonlinear nets) at the largest ``--widths``
@@ -92,6 +97,7 @@ from experiments.dmft.utils import (
 from theory_pc_utils import solve_pc_kernels
 from theory_pc_nonlin_utils import solve_pc_kernels_nonlin, get_nonlinearity
 from plot_dmft_results import (
+    feature_kernel_symbol,
     plot_pc_theory_vs_finite_loss,
     plot_pc_param_sweep_loss,
     plot_pc_kernel_width_alignment,
@@ -249,9 +255,11 @@ def _kernel_align_records(
 ):
     """Cosine alignment of last-``t`` kernels, per hidden layer.
 
-    ``C^h`` is compared at ``k=0`` and ``C^Δ`` at the last inference step
-    ``k=num_inference_steps``. All ``H`` hidden layers are included; the
-    readout layer is omitted.
+    Feature kernels are compared at ``k=0``: linear theory/finite
+    ``C^h``, nonlinear theory ``C^phi`` (returned as ``all_Ch`` by
+    ``solve_pc_kernels_nonlin``) vs finite ``phi(h)``. ``C^Δ`` is
+    compared at the last inference step ``k=num_inference_steps``. All
+    ``H`` hidden layers are included; the readout layer is omitted.
     """
     records = []
     h_final = fields["h"]
@@ -270,18 +278,19 @@ def _kernel_align_records(
         num_samples=num_samples,
     )
     for l in range(n_hidden):
+        # Linear: phi = id => C^h. Nonlinear: C^phi.
         phi_l = np.asarray(phi_fn(jnp.asarray(h_final[l])))
-        C_h_ex = empirical_pc_kernel(phi_l)
+        C_feat_ex = empirical_pc_kernel(phi_l)
         C_delta_ex = empirical_pc_kernel(delta_final[l])
         records.append(
             {
                 **meta,
                 "layer": l,
-                "kernel": "h",
+                "kernel": "h",  # feature kernel series (C^h or C^phi)
                 "alignment": float(
                     cosine_similarity(
                         final_time_pc_kernel(all_Ch[l], k=0, **slice_kw),
-                        C_h_ex,
+                        C_feat_ex,
                         eps=1e-30,
                     )
                 ),
@@ -307,7 +316,12 @@ def _kernel_align_records(
 
 
 def _feature_kernels_from_h(h, phi_fn):
-    """Empirical ``C^h`` at ``k=0`` for every hidden layer (readout omitted)."""
+    """Empirical feature kernels at ``k=0`` for every hidden layer.
+
+    Applies ``phi_fn`` then forms ``phi phi^T / N``. For linear nets
+    ``phi`` is the identity (``C^h``); for nonlinear nets this is
+    ``C^phi``. Readout omitted.
+    """
     kernels = []
     for l in range(h.shape[0]):
         phi_l = np.asarray(phi_fn(jnp.asarray(h[l])))
@@ -316,12 +330,12 @@ def _feature_kernels_from_h(h, phi_fn):
 
 
 def _final_feature_kernels(fields, phi_fn):
-    """Empirical ``C^h`` at ``k=0`` of the trained network."""
+    """Empirical feature kernels (``C^h`` / ``C^phi``) at ``k=0``."""
     return _feature_kernels_from_h(fields["h"], phi_fn)
 
 
 def _init_feature_kernels(fields, phi_fn):
-    """Empirical ``C^h`` from the untrained feedforward pass."""
+    """Empirical feature kernels from the untrained feedforward pass."""
     return _feature_kernels_from_h(fields["h_init"], phi_fn)
 
 
@@ -349,7 +363,11 @@ def _kernel_displacement_records(init_kernels, final_kernels, **meta):
 def _dmft_feature_kernels(
     all_Ch, num_inference_steps, num_training_steps, num_samples, t=-1
 ):
-    """DMFT ``C^h`` sample-sample block at ``k=0`` and training time ``t``."""
+    """DMFT feature-kernel sample-sample block at ``k=0`` and time ``t``.
+
+    ``all_Ch`` is linear ``C^h`` or nonlinear ``C^phi`` (the first return
+    of ``solve_pc_kernels_nonlin``).
+    """
     slice_kw = dict(
         num_inference_steps=num_inference_steps,
         num_training_steps=num_training_steps,
@@ -363,7 +381,7 @@ def _dmft_feature_kernels(
 def _final_dmft_feature_kernels(
     all_Ch, num_inference_steps, num_training_steps, num_samples
 ):
-    """DMFT ``C^h`` sample-sample block at ``k=0`` and last training step."""
+    """DMFT feature kernel at ``k=0`` and last training step."""
     return _dmft_feature_kernels(
         all_Ch,
         num_inference_steps,
@@ -374,7 +392,7 @@ def _final_dmft_feature_kernels(
 
 
 def _sample_traced_feature_kernels_from_h_traj(h_traj, phi_fn):
-    """Sample-traced ``T x T`` ``C^h`` at ``k=0`` for every hidden layer.
+    """Sample-traced ``T x T`` feature kernels at ``k=0`` (``C^h`` / ``C^phi``).
 
     ``h_traj`` has shape ``(n_hidden, T, P, N)``.
     """
@@ -388,7 +406,7 @@ def _sample_traced_feature_kernels_from_h_traj(h_traj, phi_fn):
 def _dmft_sample_traced_feature_kernels(
     all_Ch, num_inference_steps, num_training_steps, num_samples, k=0
 ):
-    """DMFT sample-traced ``T x T`` ``C^h`` at inference step ``k``."""
+    """DMFT sample-traced ``T x T`` feature kernel at inference step ``k``."""
     return [
         sample_traced_pc_kernel(
             Ch_l,
@@ -416,6 +434,7 @@ def _plot_k_sweep_kernels_and_displacement(
     width,
     use_nonlin_theory,
     skip_closed_form,
+    feature_symbol="h",
     **record_meta,
 ):
     """Stacked ``K``-sweep kernel grid and per-layer displacement overlay.
@@ -442,6 +461,7 @@ def _plot_k_sweep_kernels_and_displacement(
         cf_init = _init_feature_kernels(fields_cf, phi_fn)
         kernel_rows.append(("Closed-form", cf_final))
 
+    feat_tex = r"\phi" if feature_symbol == "phi" else "h"
     if kernel_rows:
         plot_final_kernel_grid(
             kernel_rows,
@@ -452,6 +472,7 @@ def _plot_k_sweep_kernels_and_displacement(
             width=width,
             filename="final_pc_kernels_grid.png",
             share_clim=True,
+            title=rf"Final $C^{{{feat_tex}}}$ feature kernels",
             dir_name="convergence",
         )
 
@@ -502,6 +523,7 @@ def _plot_k_sweep_kernels_and_displacement(
             activity_lr=activity_lr,
             width=width,
             dir_name="convergence",
+            feature_symbol=feature_symbol,
         )
     return disp_records
 
@@ -746,6 +768,9 @@ if __name__ == "__main__":
         f"finite widths={run_widths}"
     )
     phi_fn, _ = get_nonlinearity(args.act_fn, beta=args.nonlin_beta)
+    feat_sym = feature_kernel_symbol(args.act_fn)
+    feat_tex = r"\phi" if feat_sym == "phi" else "h"
+    print(f"Feature kernel for comparisons/labels: C^{feat_sym}")
     kernel_align_records = []
     theory_cache = {}
 
@@ -1271,6 +1296,7 @@ if __name__ == "__main__":
                                         width=kernel_plot_width,
                                         filename="final_pc_kernels_grid.png",
                                         share_clim=True,
+                                        title=rf"Final $C^{{{feat_tex}}}$ feature kernels",
                                         dir_name="convergence",
                                     )
                                     if (
@@ -1286,6 +1312,11 @@ if __name__ == "__main__":
                                             n_infer_iters=K_inf,
                                             width=kernel_plot_width,
                                             dir_name="convergence",
+                                            title=(
+                                                rf"Sample-traced "
+                                                rf"$C^{{{feat_tex}}}$ "
+                                                rf"feature kernels"
+                                            ),
                                         )
 
                             if (
@@ -1365,6 +1396,7 @@ if __name__ == "__main__":
                                         width=kernel_plot_width,
                                         use_nonlin_theory=use_nonlin_theory,
                                         skip_closed_form=args.skip_closed_form,
+                                        feature_symbol=feat_sym,
                                         use_skips=use_skips,
                                         param_type=param_type,
                                     )
@@ -1422,6 +1454,7 @@ if __name__ == "__main__":
                     activity_lr=activity_lr_k,
                     width=width_k,
                     dir_name="convergence",
+                    feature_symbol=feat_sym,
                 )
 
     if plot_width:
@@ -1443,6 +1476,7 @@ if __name__ == "__main__":
                     gamma_0=gamma_0_k,
                     activity_lr=activity_lr_k,
                     n_infer_iters=K_inf_k,
+                    feature_symbol=feat_sym,
                 )
         else:
             print("\nNo kernel-alignment records were collected.")

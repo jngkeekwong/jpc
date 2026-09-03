@@ -22,6 +22,28 @@ def _warn_if_nonfinite(name, arr):
         )
 
 
+def feature_kernel_symbol(act_fn=None, use_phi=None):
+    """Symbol for the compared feature kernel: ``"h"`` or ``"phi"``.
+
+    Linear nets use ``C^h`` (``phi`` is the identity). Nonlinear nets use
+    ``C^phi``. Pass ``use_phi`` to override; otherwise ``act_fn != "linear"``
+    selects ``phi``.
+    """
+    if use_phi is not None:
+        return "phi" if use_phi else "h"
+    if act_fn is None or act_fn == "linear":
+        return "h"
+    return "phi"
+
+
+def _feature_kernel_tex(symbol):
+    """TeX fragment ``h`` or ``\\phi`` for feature-kernel labels."""
+    return r"\phi" if symbol == "phi" else "h"
+
+
+_COS_YLIM = (0.0, 1.05)
+
+
 def plot_dmft_loss(dmft_loss, plots_dir, gamma_0=None):
     """Plot DMFT loss over training iterations."""
     dmft_loss = np.asarray(dmft_loss).flatten()
@@ -189,8 +211,15 @@ def plot_pc_dmft_kernels_and_loss(
     gamma_0=None,
     n_hidden=None,
     activity_lr=None,
+    feature_symbol="h",
 ):
-    """Plot PC DMFT loss and initial sample-sample Ch / Cdelta kernels."""
+    """Plot PC DMFT loss and initial sample-sample Ch/Cphi / Cdelta kernels.
+
+    ``all_Ch`` is the linear ``C^h`` or nonlinear ``C^phi`` (callers often
+    keep the name ``all_Ch`` even when the nonlinear solver returns
+    ``all_Cphi``). ``feature_symbol`` selects the ylabel (``"h"`` or
+    ``"phi"``).
+    """
     if n_hidden is not None:
         plots_dir = os.path.join(plots_dir, f"{n_hidden}_n_hidden")
     if gamma_0 is not None:
@@ -207,15 +236,20 @@ def plot_pc_dmft_kernels_and_loss(
     if os.path.exists(generic_loss):
         os.replace(generic_loss, pc_loss)
 
+    sym = _feature_kernel_tex(feature_symbol)
     plot_pc_layer_kernels(
         kernels=all_Ch,
         plots_dir=plots_dir,
-        filename="all_Ch_kernels.png",
+        filename=(
+            "all_Cphi_kernels.png"
+            if feature_symbol == "phi"
+            else "all_Ch_kernels.png"
+        ),
         num_inference_steps=num_inference_steps,
         num_training_steps=num_training_steps,
         num_samples=num_samples,
         gamma_0=gamma_0,
-        ylabel=r"$C^h$",
+        ylabel=rf"$C^{{{sym}}}$",
     )
     plot_pc_layer_kernels(
         kernels=all_Cdelta,
@@ -774,15 +808,19 @@ def plot_pc_kernel_width_alignment(
     n_hidden=None,
     activity_lr=None,
     n_infer_iters=None,
+    feature_symbol="h",
 ):
     """Plot finite-vs-theory kernel alignment vs width for every layer.
 
     ``align_df`` must have columns ``width``, ``layer``, ``kernel``
-    (``"h"`` or ``"delta"``), ``alignment``, and optionally ``seed``.
-    Mean ± std over seeds is shown when multiple trials are present.
-    Compares last-training-time hidden-layer kernels (``C^h`` at ``k=0``,
-    ``C^Δ`` at the last inference step ``k=K``) for all ``H`` hidden layers
-    (readout omitted).
+    (``"h"`` for the feature kernel ``C^h``/``C^phi``, or ``"delta"``),
+    ``alignment``, and optionally ``seed``. Mean ± std over seeds is shown
+    when multiple trials are present. Compares last-training-time
+    hidden-layer kernels (feature kernel at ``k=0``, ``C^Δ`` at the last
+    inference step ``k=K``) for all ``H`` hidden layers (readout omitted).
+
+    ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear) and
+    only affects axis labels / filenames.
     """
     plots_dir = _pc_loss_plots_dir(
         plots_dir,
@@ -795,11 +833,18 @@ def plot_pc_kernel_width_alignment(
         print("No kernel-alignment records to plot.")
         return []
 
+    sym = _feature_kernel_tex(feature_symbol)
+    feature_filename = (
+        "pc_kernel_alignment_Cphi_vs_width.png"
+        if feature_symbol == "phi"
+        else "pc_kernel_alignment_Ch_vs_width.png"
+    )
     specs = (
         (
             "h",
-            r"$A(C^{h,\ell}_{\mathrm{DMFT}}, C^{h,\ell}_{\mathrm{NN}})$",
-            "pc_kernel_alignment_Ch_vs_width.png",
+            rf"$A(C^{{{sym},\ell}}_{{\mathrm{{DMFT}}}}, "
+            rf"C^{{{sym},\ell}}_{{\mathrm{{NN}}}})$",
+            feature_filename,
         ),
         (
             "delta",
@@ -888,6 +933,7 @@ def plot_kernel_displacement(
     plots_dir,
     n_hidden=None,
     activity_lr=None,
+    feature_symbol="h",
 ):
     """Cosine similarity between the initial (``t=0``) and final (last
     training step) feature kernel at every layer, at ``k=0`` for PC --
@@ -901,6 +947,8 @@ def plot_kernel_displacement(
     present (``gamma_0s`` and/or ``n_infer_iters`` swept), only PC is
     drawn, with one curve per combination (BP does not depend on
     ``n_infer_iters`` and is dropped in this case).
+
+    ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     """
     if displacement_df is None or len(displacement_df) == 0:
         print("No kernel displacement records to plot.")
@@ -912,6 +960,7 @@ def plot_kernel_displacement(
         .sort_values(["gamma_0", "n_infer_iters"])
     )
     overlay = len(combos) > 1
+    sym = _feature_kernel_tex(feature_symbol)
 
     plt.figure(figsize=(8, 6))
     if not overlay:
@@ -980,14 +1029,16 @@ def plot_kernel_displacement(
         )
 
     plt.xlabel(r"layer $\ell$")
-    plt.ylabel(r"$\cos(C^{\cdot,\ell}_{t=0}, C^{\cdot,\ell}_{t=T})$")
+    plt.ylabel(
+        rf"$\cos(C^{{{sym},\ell}}_{{t=0}}, C^{{{sym},\ell}}_{{t=T}})$"
+    )
     title = "Feature-kernel displacement across training"
     if n_hidden is not None:
         title += f", $H={int(n_hidden)}$"
     if activity_lr is not None:
         title += f", activity lr$={activity_lr}$"
     plt.title(title)
-    plt.ylim(-1.05, 1.05)
+    plt.ylim(*_COS_YLIM)
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.4)
     plt.tight_layout()
@@ -1006,6 +1057,7 @@ def plot_pc_k_sweep_displacement(
     activity_lr=None,
     width=None,
     dir_name="alignment",
+    feature_symbol="h",
 ):
     """Overlay per-layer feature-kernel displacement for a ``K`` sweep.
 
@@ -1014,11 +1066,14 @@ def plot_pc_k_sweep_displacement(
     ``n_infer_iters``. One curve per series: DMFT (smallest ``K``,
     dashed), finite-size infer (solid, increasing ``K``), and
     closed-form (linear case, dash-dot).
+
+    ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     """
     if displacement_df is None or len(displacement_df) == 0:
         print("No K-sweep kernel displacement records to plot.")
         return None
 
+    sym = _feature_kernel_tex(feature_symbol)
     plt.figure(figsize=(8, 6))
     infer_ks = sorted(
         {
@@ -1090,7 +1145,9 @@ def plot_pc_k_sweep_displacement(
         )
 
     plt.xlabel(r"layer $\ell$")
-    plt.ylabel(r"$\cos(C^{\cdot,\ell}_{t=0}, C^{\cdot,\ell}_{t=T})$")
+    plt.ylabel(
+        rf"$\cos(C^{{{sym},\ell}}_{{t=0}}, C^{{{sym},\ell}}_{{t=T}})$"
+    )
     title = "Feature-kernel displacement across training"
     if n_hidden is not None:
         title += f", $H={int(n_hidden)}$"
@@ -1101,7 +1158,7 @@ def plot_pc_k_sweep_displacement(
     if activity_lr is not None:
         title += f", activity lr$={activity_lr}$"
     plt.title(title)
-    plt.ylim(-1.05, 1.05)
+    plt.ylim(*_COS_YLIM)
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.4)
     plt.tight_layout()
@@ -1128,20 +1185,23 @@ def plot_kernel_displacement_per_timepoint(
     n_infer_iters=None,
     width=None,
     dir_name="alignment",
+    feature_symbol="h",
 ):
-    """Per-layer feature-kernel displacement from ``t0``, one figure per
-    training timepoint ``t``.
+    """Per-layer feature-kernel displacement from ``t0``, one subplot per
+    training timepoint ``t`` in a single figure.
 
     ``displacement_df`` must have columns ``t``, ``layer``, ``method``
     (``"pc"`` or ``"bp"``), and ``displacement`` -- the cosine similarity
     between the feature kernel at the first recorded timepoint (``t0``,
-    typically ``t=0``) and at ``t``, for every hidden layer. One figure is
-    saved per unique ``t`` (x-axis: layer, one curve for PC and one for
-    backprop), named ``kernel_displacement_vs_layer_t{t}.png``.
+    typically ``t=0``) and at ``t``, for every hidden layer. Subplots are
+    arranged on an auto grid (e.g. 2x3 for 6 timepoints). Saved as
+    ``kernel_displacement_vs_layer_grid.png``.
+
+    ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     """
     if displacement_df is None or len(displacement_df) == 0:
         print("No kernel displacement records to plot.")
-        return []
+        return None
 
     out_dir = _alignment_plots_dir(
         plots_dir,
@@ -1152,17 +1212,29 @@ def plot_kernel_displacement_per_timepoint(
         dir_name=dir_name,
     )
 
-    save_paths = []
-    for t in sorted(displacement_df["t"].unique()):
+    timepoints = sorted(displacement_df["t"].unique())
+    n_t = len(timepoints)
+    ncols = int(np.ceil(np.sqrt(n_t)))
+    nrows = int(np.ceil(n_t / ncols))
+    sym = _feature_kernel_tex(feature_symbol)
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(4.0 * ncols, 3.2 * nrows),
+        squeeze=False,
+        sharey=True,
+    )
+    for i, t in enumerate(timepoints):
+        ax = axes[i // ncols, i % ncols]
         sub = displacement_df[displacement_df["t"] == t]
 
-        plt.figure(figsize=(8, 6))
         pc_sub = sub[sub["method"] == "pc"].sort_values("layer")
         if len(pc_sub):
             layers = np.asarray(pc_sub["layer"], dtype=float) + 1
             values = np.asarray(pc_sub["displacement"], dtype=float)
             _warn_if_nonfinite(f"pc displacement (t={t})", values)
-            plt.plot(
+            ax.plot(
                 layers, values, marker="o", color="tab:blue", label="PC"
             )
 
@@ -1171,7 +1243,7 @@ def plot_kernel_displacement_per_timepoint(
             layers = np.asarray(bp_sub["layer"], dtype=float) + 1
             values = np.asarray(bp_sub["displacement"], dtype=float)
             _warn_if_nonfinite(f"bp displacement (t={t})", values)
-            plt.plot(
+            ax.plot(
                 layers,
                 values,
                 marker="s",
@@ -1179,30 +1251,39 @@ def plot_kernel_displacement_per_timepoint(
                 label="Backprop",
             )
 
-        plt.xlabel(r"layer $\ell$")
-        plt.ylabel(r"$\cos(C^{\cdot,\ell}_{t_0}, C^{\cdot,\ell}_{t})$")
-        title = f"Feature-kernel displacement from $t_0$, $t={int(t)}$"
-        if n_hidden is not None:
-            title += f", $H={int(n_hidden)}$"
-        if width is not None:
-            title += f", $N={int(width)}$"
-        if gamma_0 is not None:
-            title += f", $\\gamma_0={gamma_0}$"
-        if activity_lr is not None:
-            title += f", activity lr$={activity_lr}$"
-        plt.title(title)
-        plt.ylim(-1.05, 1.05)
-        plt.legend(fontsize=8)
-        plt.grid(True, alpha=0.4)
-        plt.tight_layout()
-        save_path = os.path.join(
-            out_dir, f"kernel_displacement_vs_layer_t{int(t)}.png"
-        )
-        plt.savefig(save_path, bbox_inches="tight")
-        plt.close()
-        print(f"Kernel displacement plot (t={int(t)}) saved to {save_path}")
-        save_paths.append(save_path)
-    return save_paths
+        ax.set_title(rf"$t={int(t)}$")
+        ax.set_xlabel(r"layer $\ell$")
+        ax.set_ylim(*_COS_YLIM)
+        ax.grid(True, alpha=0.4)
+        if i % ncols == 0:
+            ax.set_ylabel(
+                rf"$\cos(C^{{{sym},\ell}}_{{t_0}}, "
+                rf"C^{{{sym},\ell}}_{{t}})$"
+            )
+        if i == 0:
+            ax.legend(fontsize=8)
+
+    for j in range(n_t, nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+
+    fig_title = "Feature-kernel displacement from $t_0$"
+    if n_hidden is not None:
+        fig_title += f", $H={int(n_hidden)}$"
+    if width is not None:
+        fig_title += f", $N={int(width)}$"
+    if gamma_0 is not None:
+        fig_title += f", $\\gamma_0={gamma_0}$"
+    if activity_lr is not None:
+        fig_title += f", activity lr$={activity_lr}$"
+    fig.suptitle(fig_title, y=1.02)
+    fig.tight_layout()
+    save_path = os.path.join(
+        out_dir, "kernel_displacement_vs_layer_grid.png"
+    )
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Kernel displacement grid saved to {save_path}")
+    return save_path
 
 
 def plot_pc_bp_alignment_vs_time(
@@ -1214,12 +1295,15 @@ def plot_pc_bp_alignment_vs_time(
     n_infer_iters=None,
     width=None,
     dir_name="alignment",
+    feature_symbol="h",
 ):
     """PC-BP feature-kernel cosine alignment over training time.
 
     ``alignment_df`` must have columns ``t``, ``layer``, and
     ``alignment``. One curve is drawn per hidden layer, x-axis is
     training time ``t``.
+
+    ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     """
     if alignment_df is None or len(alignment_df) == 0:
         print("No PC-BP kernel alignment records to plot.")
@@ -1228,6 +1312,7 @@ def plot_pc_bp_alignment_vs_time(
     layers = sorted(alignment_df["layer"].unique())
     cmap = plt.get_cmap("viridis")
     colors = [cmap(i / max(1, len(layers) - 1)) for i in range(len(layers))]
+    sym = _feature_kernel_tex(feature_symbol)
 
     plt.figure(figsize=(8, 6))
     for layer, color in zip(layers, colors):
@@ -1245,7 +1330,8 @@ def plot_pc_bp_alignment_vs_time(
 
     plt.xlabel("$t$")
     plt.ylabel(
-        r"$\cos(C^{h,\ell}_{\mathrm{PC}}(t), C^{h,\ell}_{\mathrm{BP}}(t))$"
+        rf"$\cos(C^{{{sym},\ell}}_{{\mathrm{{PC}}}}(t), "
+        rf"C^{{{sym},\ell}}_{{\mathrm{{BP}}}}(t))$"
     )
     title = "PC vs backprop feature-kernel alignment over training"
     if n_hidden is not None:
@@ -1257,7 +1343,7 @@ def plot_pc_bp_alignment_vs_time(
     if activity_lr is not None:
         title += f", activity lr$={activity_lr}$"
     plt.title(title)
-    plt.ylim(-1.05, 1.05)
+    plt.ylim(*_COS_YLIM)
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.4)
     plt.tight_layout()
@@ -1276,6 +1362,67 @@ def plot_pc_bp_alignment_vs_time(
     return save_path
 
 
+def plot_pc_bp_loss(
+    pc_losses,
+    bp_losses,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+):
+    """Overlay finite-size PC and BP training-loss curves vs time."""
+    pc_losses = np.asarray(pc_losses).flatten()
+    bp_losses = np.asarray(bp_losses).flatten()
+    _warn_if_nonfinite("pc_losses", pc_losses)
+    _warn_if_nonfinite("bp_losses", bp_losses)
+
+    plt.figure(figsize=(8, 6))
+    t_pc = np.arange(len(pc_losses))
+    t_bp = np.arange(len(bp_losses))
+    plt.plot(
+        t_pc, pc_losses, marker="o", color="tab:blue", label="PC", alpha=0.9
+    )
+    plt.plot(
+        t_bp,
+        bp_losses,
+        marker="s",
+        color="tab:orange",
+        label="Backprop",
+        alpha=0.9,
+    )
+    plt.xlabel("$t$")
+    plt.ylabel("Training loss (MSE)")
+    title = "PC vs backprop training loss"
+    if n_hidden is not None:
+        title += f", $H={int(n_hidden)}$"
+    if width is not None:
+        title += f", $N={int(width)}$"
+    if gamma_0 is not None:
+        title += f", $\\gamma_0={gamma_0}$"
+    if activity_lr is not None:
+        title += f", activity lr$={activity_lr}$"
+    plt.title(title)
+    plt.legend(fontsize=8)
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    save_path = os.path.join(out_dir, "pc_bp_loss.png")
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"PC-BP loss plot saved to {save_path}")
+    return save_path
+
+
 def plot_pc_last_layer_displacement_vs_gamma(
     displacement_df,
     plots_dir,
@@ -1283,6 +1430,7 @@ def plot_pc_last_layer_displacement_vs_gamma(
     activity_lr=None,
     width=None,
     dir_name="alignment",
+    feature_symbol="h",
 ):
     """Last-hidden-layer displacement vs ``gamma_0``, one curve per ``K``.
 
@@ -1292,6 +1440,8 @@ def plot_pc_last_layer_displacement_vs_gamma(
     (``layer == max(layer)``, i.e. ``ℓ = H``) is drawn. DMFT is the
     smallest ``K`` (dashed); finite-size infer is solid for increasing
     ``K``; closed-form is dash-dot in the linear case.
+
+    ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     """
     if displacement_df is None or len(displacement_df) == 0:
         print("No last-layer kernel displacement records to plot.")
@@ -1303,6 +1453,7 @@ def plot_pc_last_layer_displacement_vs_gamma(
         print("No last-layer kernel displacement records to plot.")
         return None
 
+    sym = _feature_kernel_tex(feature_symbol)
     plt.figure(figsize=(8, 6))
     infer_ks = sorted(
         {
@@ -1378,7 +1529,7 @@ def plot_pc_last_layer_displacement_vs_gamma(
 
     plt.xlabel(r"$\gamma_0$")
     plt.ylabel(
-        rf"$\cos(C^{{\cdot,H}}_{{t=0}}, C^{{\cdot,H}}_{{t=T}})$"
+        rf"$\cos(C^{{{sym},H}}_{{t=0}}, C^{{{sym},H}}_{{t=T}})$"
     )
     title = rf"Last-layer ($\ell={last_layer + 1}$) feature-kernel displacement"
     if n_hidden is not None:
@@ -1388,7 +1539,7 @@ def plot_pc_last_layer_displacement_vs_gamma(
     if activity_lr is not None:
         title += f", activity lr$={activity_lr}$"
     plt.title(title)
-    plt.ylim(-1.05, 1.05)
+    plt.ylim(*_COS_YLIM)
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.4)
     plt.tight_layout()
@@ -1412,6 +1563,7 @@ def plot_pc_bp_kernel_alignment(
     plots_dir,
     n_hidden=None,
     activity_lr=None,
+    feature_symbol="h",
 ):
     """Cosine similarity between the final PC and final BP feature kernels
     at every layer (both at the last training step; PC at ``k=0``).
@@ -1419,6 +1571,8 @@ def plot_pc_bp_kernel_alignment(
     ``alignment_df`` must have columns ``layer``, ``alignment``,
     ``gamma_0`` and ``n_infer_iters``. One curve is drawn per
     ``(gamma_0, n_infer_iters)`` combination present in the data.
+
+    ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     """
     if alignment_df is None or len(alignment_df) == 0:
         print("No PC-BP kernel alignment records to plot.")
@@ -1431,6 +1585,7 @@ def plot_pc_bp_kernel_alignment(
     )
     cmap = plt.get_cmap("viridis")
     colors = [cmap(i / max(1, len(combos) - 1)) for i in range(len(combos))]
+    sym = _feature_kernel_tex(feature_symbol)
 
     plt.figure(figsize=(8, 6))
     # itertuples (not iterrows) keeps each field's own dtype, since
@@ -1470,14 +1625,17 @@ def plot_pc_bp_kernel_alignment(
         )
 
     plt.xlabel(r"layer $\ell$")
-    plt.ylabel(r"$\cos(C^{h,\ell}_{\mathrm{PC}}, H^{\ell}_{\mathrm{BP}})$")
+    plt.ylabel(
+        rf"$\cos(C^{{{sym},\ell}}_{{\mathrm{{PC}}}}, "
+        rf"C^{{{sym},\ell}}_{{\mathrm{{BP}}}})$"
+    )
     title = "PC vs backprop final feature-kernel alignment"
     if n_hidden is not None:
         title += f", $H={int(n_hidden)}$"
     if activity_lr is not None:
         title += f", activity lr$={activity_lr}$"
     plt.title(title)
-    plt.ylim(-1.05, 1.05)
+    plt.ylim(*_COS_YLIM)
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.4)
     plt.tight_layout()
@@ -1598,6 +1756,7 @@ def plot_temporal_kernel_grid(
     share_clim=True,
     dir_name="alignment",
     origin="lower",
+    title="Sample-traced feature kernels",
 ):
     """Grid of sample-traced (``T x T``) feature kernels at ``k=0``.
 
@@ -1614,7 +1773,7 @@ def plot_temporal_kernel_grid(
         width=width,
         filename=filename,
         share_clim=share_clim,
-        title="Sample-traced feature kernels",
+        title=title,
         dir_name=dir_name,
         origin=origin,
     )

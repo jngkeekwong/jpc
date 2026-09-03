@@ -2,9 +2,10 @@
 
 Trains one finite-width PC network and one finite-width BP network on the
 same data (for a single, given set of hyperparameters — no DMFT theory,
-no sweeps), then compares their hidden-layer feature kernels
-``C^{h,\\ell} = phi(h^\\ell) phi(h^\\ell)^T / N`` across training. PC
-inference is selected via ``--pc_infer_mode``: ``infer`` runs iterative
+no sweeps), then compares their hidden-layer feature kernels across
+training. Linear nets use ``C^{h,\\ell}`` (``phi`` is the identity);
+nonlinear nets use ``C^{\\phi,\\ell} = \\phi(h^\\ell)\\phi(h^\\ell)^T / N``.
+PC inference is selected via ``--pc_infer_mode``: ``infer`` runs iterative
 activity optimisation (``--n_infer_iters`` gradient steps per training
 step); ``closed_form`` solves the linear equilibrium activities directly
 (requires ``--act_fn linear``).
@@ -13,13 +14,15 @@ For ``--n_timepoints`` equally spaced training steps ``t`` (including
 ``t=0``, the untrained feedforward network, and ``t=T-1``, the last
 training step), this produces:
 
+- PC vs BP training-loss curves
+  (``alignment/pc_bp_loss.png``).
 - Feature-kernel grid: one figure per timepoint, a ``P x P`` heatmap per
   hidden layer, top row PC / bottom row backprop
   (``alignment/feature_kernels_grid_t{t}.png``).
-- Kernel displacement: one figure per timepoint, cosine similarity of
-  each layer's feature kernel at ``t`` vs. at ``t=0`` (the first
-  timepoint), one curve for PC and one for backprop, x-axis is layer
-  (``alignment/kernel_displacement_vs_layer_t{t}.png``).
+- Kernel displacement: one figure with a subplot per timepoint (auto
+  grid), cosine similarity of each layer's feature kernel at ``t`` vs.
+  at ``t=0``, PC and BP curves, x-axis is layer
+  (``alignment/kernel_displacement_vs_layer_grid.png``).
 - PC-BP alignment vs. time: a single figure, cosine similarity between
   the PC and backprop feature kernels at each layer, x-axis is training
   time ``t``, one curve per layer
@@ -66,10 +69,12 @@ from analyse_convergence import (
     _sample_traced_feature_kernels_from_h_traj,
 )
 from plot_dmft_results import (
+    feature_kernel_symbol,
     plot_final_kernel_grid,
     plot_temporal_kernel_grid,
     plot_kernel_displacement_per_timepoint,
     plot_pc_bp_alignment_vs_time,
+    plot_pc_bp_loss,
 )
 
 
@@ -359,11 +364,15 @@ if __name__ == "__main__":
     print(f"BP final training loss: {float(np.asarray(bp_losses).flatten()[-1]):.4e}")
 
     phi_fn, _ = get_nonlinearity(args.act_fn, beta=args.nonlin_beta)
+    feat_sym = feature_kernel_symbol(args.act_fn)
+    feat_tex = r"\phi" if feat_sym == "phi" else "h"
 
     timepoints = _select_timepoints(T_train, args.n_timepoints)
-    print(f"\nUsing timepoints t = {timepoints} (of T = {T_train})\n")
+    print(f"\nUsing timepoints t = {timepoints} (of T = {T_train})")
+    print(f"Feature kernel: C^{feat_sym}\n")
 
     # Feature kernels (P x P), per layer, at every selected timepoint.
+    # Linear: C^h (phi = id). Nonlinear: C^phi = phi(h) phi(h)^T / N.
     pc_kernels_by_t = {
         t: _feature_kernels_from_h(pc_h_traj[:, t], phi_fn)
         for t in timepoints
@@ -378,6 +387,26 @@ if __name__ == "__main__":
         "plots",
         f"{width}_width",
         f"{args.pc_infer_mode}_pc_infer_mode",
+    )
+    plot_kw = dict(
+        plots_dir=plots_dir,
+        gamma_0=args.gamma_0,
+        n_hidden=n_hidden,
+        activity_lr=args.activity_lr,
+        n_infer_iters=args.n_infer_iters,
+        width=width,
+        feature_symbol=feat_sym,
+    )
+
+    plot_pc_bp_loss(
+        pc_losses,
+        bp_losses,
+        plots_dir=plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=args.gamma_0,
+        activity_lr=args.activity_lr,
+        n_infer_iters=args.n_infer_iters,
+        width=width,
     )
 
     # --- Feature-kernel grid: one figure per timepoint, top=PC, bottom=BP ---
@@ -395,7 +424,7 @@ if __name__ == "__main__":
             width=width,
             filename=f"feature_kernels_grid_t{t}.png",
             share_clim=True,
-            title=f"Feature kernels ($t={t}$)",
+            title=rf"$C^{{{feat_tex}}}$ feature kernels ($t={t}$)",
             dir_name="alignment",
         )
 
@@ -443,22 +472,12 @@ if __name__ == "__main__":
 
     plot_kernel_displacement_per_timepoint(
         pd.DataFrame(displacement_records),
-        plots_dir=plots_dir,
-        n_hidden=n_hidden,
-        gamma_0=args.gamma_0,
-        activity_lr=args.activity_lr,
-        n_infer_iters=args.n_infer_iters,
-        width=width,
+        **plot_kw,
     )
 
     plot_pc_bp_alignment_vs_time(
         pd.DataFrame(alignment_records),
-        plots_dir=plots_dir,
-        n_hidden=n_hidden,
-        gamma_0=args.gamma_0,
-        activity_lr=args.activity_lr,
-        n_infer_iters=args.n_infer_iters,
-        width=width,
+        **plot_kw,
     )
 
     # --- Sample-traced temporal kernels (T x T): same grid scheme, one plot ---
@@ -481,6 +500,7 @@ if __name__ == "__main__":
         width=width,
         filename="temporal_kernels_grid.png",
         dir_name="alignment",
+        title=rf"Sample-traced $C^{{{feat_tex}}}$ feature kernels",
     )
 
     if args.cleanup_npy:

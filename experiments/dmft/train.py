@@ -552,6 +552,9 @@ if __name__ == "__main__":
                                     gamma_0=gamma_0,
                                     n_hidden=n_hidden,
                                     activity_lr=activity_lr,
+                                    feature_symbol=(
+                                        "phi" if use_nonlin_theory else "h"
+                                    ),
                                 )
 
                             # --- Finite-size PC simulation (infer) ---
