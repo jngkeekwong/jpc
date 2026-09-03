@@ -243,6 +243,59 @@ def bp_sample_kernel_at(kernel, t=-1):
     return arr[t, :, t, :]
 
 
+def bp_hidden_preactivations(model, X_input):
+    """Per-layer pre-activation ``h^l`` for the finite-width BP MLP.
+
+    Mirrors ``pc_hidden_preactivations_and_errors``'s ``h`` convention:
+    each hidden layer's pre-activation output ``h^l`` is returned
+    *before* the next layer's nonlinearity is applied (so ``phi(h^l)``,
+    computed later, is the actual feature fed forward). This lets BP and
+    PC feature kernels be compared on equal footing. Only the ``n_hidden``
+    hidden layers are returned; the readout (last of ``model.L`` layers)
+    is omitted, matching the PC convention.
+
+    Args:
+        model: a ``dmft.utils.MLP`` (or ``limits_paper.utils.MLP``).
+        X_input: array of shape ``(P, D)``.
+
+    Returns:
+        A list of ``n_hidden`` arrays, each of shape ``(P, N)``.
+    """
+    param_type = model.param_type
+    N, L, D = model.N, model.L, model.D
+    use_skips = model.use_skips
+
+    def _single(x):
+        hs = []
+        h = x
+        if param_type == "mupc":
+            for i, f in enumerate(model.layers):
+                if (i + 1) == 1:
+                    h = f(h) / jnp.sqrt(D)
+                elif 1 < (i + 1) < L:
+                    residual = h if use_skips else 0.0
+                    rescaling = (
+                        jnp.sqrt(N * L) if use_skips else jnp.sqrt(N)
+                    )
+                    h = (f(h) / rescaling) + residual
+                else:
+                    h = f(h) / N
+                if (i + 1) < L:
+                    hs.append(h)
+        else:
+            for i, f in enumerate(model.layers):
+                residual = (
+                    h if use_skips and (1 < (i + 1) < L) else 0.0
+                )
+                h = f(h) + residual
+                if (i + 1) < L:
+                    hs.append(h)
+        return hs
+
+    hs_batched = jax.vmap(_single)(X_input)
+    return list(hs_batched)
+
+
 def collect_final_pc_kernel_fields(
     model,
     skip_model,
@@ -581,8 +634,17 @@ def train_bpn(
       n_train_iters,
       loss_id,
       save_dir,
-      store_grads=False
+      store_grads=False,
+      h_k0_steps=None,
 ):
+    """Train a finite-width BP MLP.
+
+    If ``h_k0_steps`` is a list, each training step appends the hidden
+    pre-activations ``h^l`` (see ``bp_hidden_preactivations``), *before*
+    that step's parameter update, with shape ``(n_hidden, P, N)`` -
+    mirroring ``train_pcn``'s ``h_k0_steps`` so PC and BP feature-kernel
+    trajectories can be compared on equal footing.
+    """
     os.makedirs(save_dir, exist_ok=True)
 
     # Optimiser
@@ -617,6 +679,14 @@ def train_bpn(
     bp_grads = [] if store_grads else None
 
     for _ in range(n_train_iters):
+        if h_k0_steps is not None:
+            hs = bp_hidden_preactivations(model, X_input)
+            h_k0_steps.append(
+                np.stack(
+                    [np.asarray(h, dtype=np.float32) for h in hs], axis=0
+                )
+            )
+
         # Record loss before the parameter update to match get_Delta / DMFT
         # step indexing (pre-update residual).
         if loss_id == "mse":

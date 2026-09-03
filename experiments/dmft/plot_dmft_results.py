@@ -1119,6 +1119,163 @@ def plot_pc_k_sweep_displacement(
     return save_path
 
 
+def plot_kernel_displacement_per_timepoint(
+    displacement_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+):
+    """Per-layer feature-kernel displacement from ``t0``, one figure per
+    training timepoint ``t``.
+
+    ``displacement_df`` must have columns ``t``, ``layer``, ``method``
+    (``"pc"`` or ``"bp"``), and ``displacement`` -- the cosine similarity
+    between the feature kernel at the first recorded timepoint (``t0``,
+    typically ``t=0``) and at ``t``, for every hidden layer. One figure is
+    saved per unique ``t`` (x-axis: layer, one curve for PC and one for
+    backprop), named ``kernel_displacement_vs_layer_t{t}.png``.
+    """
+    if displacement_df is None or len(displacement_df) == 0:
+        print("No kernel displacement records to plot.")
+        return []
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+
+    save_paths = []
+    for t in sorted(displacement_df["t"].unique()):
+        sub = displacement_df[displacement_df["t"] == t]
+
+        plt.figure(figsize=(8, 6))
+        pc_sub = sub[sub["method"] == "pc"].sort_values("layer")
+        if len(pc_sub):
+            layers = np.asarray(pc_sub["layer"], dtype=float) + 1
+            values = np.asarray(pc_sub["displacement"], dtype=float)
+            _warn_if_nonfinite(f"pc displacement (t={t})", values)
+            plt.plot(
+                layers, values, marker="o", color="tab:blue", label="PC"
+            )
+
+        bp_sub = sub[sub["method"] == "bp"].sort_values("layer")
+        if len(bp_sub):
+            layers = np.asarray(bp_sub["layer"], dtype=float) + 1
+            values = np.asarray(bp_sub["displacement"], dtype=float)
+            _warn_if_nonfinite(f"bp displacement (t={t})", values)
+            plt.plot(
+                layers,
+                values,
+                marker="s",
+                color="tab:orange",
+                label="Backprop",
+            )
+
+        plt.xlabel(r"layer $\ell$")
+        plt.ylabel(r"$\cos(C^{\cdot,\ell}_{t_0}, C^{\cdot,\ell}_{t})$")
+        title = f"Feature-kernel displacement from $t_0$, $t={int(t)}$"
+        if n_hidden is not None:
+            title += f", $H={int(n_hidden)}$"
+        if width is not None:
+            title += f", $N={int(width)}$"
+        if gamma_0 is not None:
+            title += f", $\\gamma_0={gamma_0}$"
+        if activity_lr is not None:
+            title += f", activity lr$={activity_lr}$"
+        plt.title(title)
+        plt.ylim(-1.05, 1.05)
+        plt.legend(fontsize=8)
+        plt.grid(True, alpha=0.4)
+        plt.tight_layout()
+        save_path = os.path.join(
+            out_dir, f"kernel_displacement_vs_layer_t{int(t)}.png"
+        )
+        plt.savefig(save_path, bbox_inches="tight")
+        plt.close()
+        print(f"Kernel displacement plot (t={int(t)}) saved to {save_path}")
+        save_paths.append(save_path)
+    return save_paths
+
+
+def plot_pc_bp_alignment_vs_time(
+    alignment_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+):
+    """PC-BP feature-kernel cosine alignment over training time.
+
+    ``alignment_df`` must have columns ``t``, ``layer``, and
+    ``alignment``. One curve is drawn per hidden layer, x-axis is
+    training time ``t``.
+    """
+    if alignment_df is None or len(alignment_df) == 0:
+        print("No PC-BP kernel alignment records to plot.")
+        return None
+
+    layers = sorted(alignment_df["layer"].unique())
+    cmap = plt.get_cmap("viridis")
+    colors = [cmap(i / max(1, len(layers) - 1)) for i in range(len(layers))]
+
+    plt.figure(figsize=(8, 6))
+    for layer, color in zip(layers, colors):
+        sub = alignment_df[alignment_df["layer"] == layer].sort_values("t")
+        t = np.asarray(sub["t"], dtype=float)
+        values = np.asarray(sub["alignment"], dtype=float)
+        _warn_if_nonfinite(f"pc-bp alignment layer={int(layer)}", values)
+        plt.plot(
+            t,
+            values,
+            marker="o",
+            color=color,
+            label=rf"$\ell = {int(layer) + 1}$",
+        )
+
+    plt.xlabel("$t$")
+    plt.ylabel(
+        r"$\cos(C^{h,\ell}_{\mathrm{PC}}(t), C^{h,\ell}_{\mathrm{BP}}(t))$"
+    )
+    title = "PC vs backprop feature-kernel alignment over training"
+    if n_hidden is not None:
+        title += f", $H={int(n_hidden)}$"
+    if width is not None:
+        title += f", $N={int(width)}$"
+    if gamma_0 is not None:
+        title += f", $\\gamma_0={gamma_0}$"
+    if activity_lr is not None:
+        title += f", activity lr$={activity_lr}$"
+    plt.title(title)
+    plt.ylim(-1.05, 1.05)
+    plt.legend(fontsize=8)
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    save_path = os.path.join(out_dir, "pc_bp_kernel_alignment_vs_time.png")
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"PC-BP kernel alignment (vs time) plot saved to {save_path}")
+    return save_path
+
+
 def plot_pc_last_layer_displacement_vs_gamma(
     displacement_df,
     plots_dir,

@@ -1,12 +1,39 @@
-"""Kernel-alignment analysis for PC and BP DMFT theory.
+"""Finite-size PC vs backprop feature-kernel alignment analysis.
 
-Runs PC DMFT theory, then BP DMFT theory, and plots kernel displacement
-and PC–BP feature-kernel alignment. Finite-width simulations are omitted.
+Trains one finite-width PC network and one finite-width BP network on the
+same data (for a single, given set of hyperparameters — no DMFT theory,
+no sweeps), then compares their hidden-layer feature kernels
+``C^{h,\\ell} = phi(h^\\ell) phi(h^\\ell)^T / N`` across training. PC
+inference is selected via ``--pc_infer_mode``: ``infer`` runs iterative
+activity optimisation (``--n_infer_iters`` gradient steps per training
+step); ``closed_form`` solves the linear equilibrium activities directly
+(requires ``--act_fn linear``).
 
-``--seed`` draws three independent RNG streams (dataset, weight init,
-PC DMFT Monte Carlo). BP Monte Carlo is folded in from the PC stream so
-the two solvers do not share keys. Theory always uses the same ``(X, y)``
-as would a finite-size run with this seed.
+For ``--n_timepoints`` equally spaced training steps ``t`` (including
+``t=0``, the untrained feedforward network, and ``t=T-1``, the last
+training step), this produces:
+
+- Feature-kernel grid: one figure per timepoint, a ``P x P`` heatmap per
+  hidden layer, top row PC / bottom row backprop
+  (``alignment/feature_kernels_grid_t{t}.png``).
+- Kernel displacement: one figure per timepoint, cosine similarity of
+  each layer's feature kernel at ``t`` vs. at ``t=0`` (the first
+  timepoint), one curve for PC and one for backprop, x-axis is layer
+  (``alignment/kernel_displacement_vs_layer_t{t}.png``).
+- PC-BP alignment vs. time: a single figure, cosine similarity between
+  the PC and backprop feature kernels at each layer, x-axis is training
+  time ``t``, one curve per layer
+  (``alignment/pc_bp_kernel_alignment_vs_time.png``).
+- Sample-traced temporal kernels: a single figure using the same grid
+  scheme as the feature-kernel grid (top row PC / bottom row backprop,
+  one column per layer), but with ``T x T`` kernels traced over samples
+  and spanning the whole training trajectory at once
+  (``alignment/temporal_kernels_grid.png``).
+
+``--seed`` draws two independent RNG streams (dataset, weight init); PC
+and BP get independent weight-init keys folded from the same parent so
+neither reuses the other's randomness. PC and BP always train on the
+same ``(X, y)``.
 
 Use the ``PC_dmft_env`` conda environment:
     /data/ndcn-computational-neuroscience/mert5001/envs/PC_dmft_env/bin/python analyse_alignment.py
@@ -22,101 +49,121 @@ import pandas as pd
 
 from experiments.datasets import get_dataloaders
 from experiments.mupc_paper.utils import set_seed
+from experiments.limits_paper.utils import setup_bp_experiment
 from experiments.dmft.utils import (
     CIFAR_GRAY_DIM,
+    MLP,
     create_tiny_cifar10_dataset,
     create_toy_dataset,
+    cleanup_experiment_dirs,
     cosine_similarity,
-    final_time_pc_kernel,
-    bp_sample_kernel_at,
+    train_bpn,
 )
-from theory_utils import solve_kernels, solve_kernels_nonlin, get_Delta, solve_Delta
-from theory_pc_utils import solve_pc_kernels
-from theory_pc_nonlin_utils import solve_pc_kernels_nonlin
+from theory_pc_nonlin_utils import get_nonlinearity
+from analyse_convergence import (
+    _train_finite_pc,
+    _feature_kernels_from_h,
+    _sample_traced_feature_kernels_from_h_traj,
+)
 from plot_dmft_results import (
-    plot_dmft_kernels_and_loss,
-    plot_pc_dmft_kernels_and_loss,
-    plot_kernel_displacement,
-    plot_pc_bp_kernel_alignment,
     plot_final_kernel_grid,
+    plot_temporal_kernel_grid,
+    plot_kernel_displacement_per_timepoint,
+    plot_pc_bp_alignment_vs_time,
 )
 
 
-def _alignment_and_displacement_records(
-    all_Ch,
-    all_H,
-    num_inference_steps,
-    num_training_steps,
-    num_samples,
-    **meta,
-):
-    """Per-layer PC/BP feature-kernel displacement and PC-BP alignment.
+def _select_timepoints(n_train_iters, n_timepoints):
+    """``n_timepoints`` equally spaced training-step indices.
 
-    ``all_Ch`` are PC theory kernels (sample-sample block taken at
-    ``k=0``); ``all_H`` are BP theory kernels, or ``None`` to skip BP.
-    "Initial" is training step ``t=0`` (post-init, pre-update); "final"
-    is the last training step.
-
-    Returns ``(displacement_records, alignment_records, pc_final_kernels,
-    bp_final_kernels)``, where the last two are lists of ``P x P`` arrays
-    (one per layer) suitable for ``plot_final_kernel_grid``.
+    Always includes both endpoints (``t=0`` and ``t=n_train_iters - 1``).
+    If ``n_timepoints >= n_train_iters``, every training step is used.
     """
-    displacement_records = []
-    alignment_records = []
-    pc_final_kernels = []
-    bp_final_kernels = [] if all_H is not None else None
+    n_timepoints = max(2, min(n_timepoints, n_train_iters))
+    idx = np.round(
+        np.linspace(0, n_train_iters - 1, n_timepoints)
+    ).astype(int)
+    return np.unique(idx).tolist()
 
-    slice_kw = dict(
-        num_inference_steps=num_inference_steps,
-        num_training_steps=num_training_steps,
-        num_samples=num_samples,
+
+def _train_finite_bp(
+    key,
+    *,
+    results_dir,
+    input_dim,
+    output_dim,
+    n_samples,
+    n_hidden,
+    use_skips,
+    act_fn,
+    param_type,
+    param_lr,
+    gamma_0,
+    param_optim_id,
+    n_train_iters,
+    width,
+    loss_id,
+    seed,
+    X_input,
+    Y_target,
+    collect_h_k0=True,
+):
+    """Run one finite-width BP training job.
+
+    Returns ``(losses, h_k0_traj)``. ``h_k0_traj`` has shape
+    ``(n_hidden, T, P, N)`` — the hidden pre-activations ``h^l`` (see
+    ``bp_hidden_preactivations`` in ``experiments.dmft.utils``) at every
+    training step, before that step's parameter update — or ``None`` if
+    ``collect_h_k0`` is False.
+    """
+    save_dir = setup_bp_experiment(
+        results_dir=results_dir,
+        input_dim=input_dim,
+        n_samples=n_samples,
+        n_hidden=n_hidden,
+        use_skips=use_skips,
+        act_fn=act_fn,
+        param_type=param_type,
+        optim_id=param_optim_id,
+        param_lr=param_lr,
+        gamma_0=gamma_0,
+        n_train_iters=n_train_iters,
+        width=width,
+        loss_id=loss_id,
+        seed=seed,
     )
-    if all_H is not None and len(all_H) != len(all_Ch):
-        raise ValueError(
-            "PC and BP theory have a different number of layers: "
-            f"PC={len(all_Ch)}, BP={len(all_H)}."
-        )
-
-    for l, Ch_l in enumerate(all_Ch):
-        pc_init = final_time_pc_kernel(Ch_l, k=0, t=0, **slice_kw)
-        pc_final = final_time_pc_kernel(Ch_l, k=0, t=-1, **slice_kw)
-        pc_final_kernels.append(pc_final)
-        displacement_records.append({
-            **meta,
-            "layer": l,
-            "method": "pc",
-            "displacement": float(
-                cosine_similarity(pc_init, pc_final, eps=1e-30)
-            ),
-        })
-
-        if all_H is not None:
-            H_l = all_H[l]
-            bp_init = bp_sample_kernel_at(H_l, t=0)
-            bp_final = bp_sample_kernel_at(H_l, t=-1)
-            bp_final_kernels.append(bp_final)
-            displacement_records.append({
-                **meta,
-                "layer": l,
-                "method": "bp",
-                "displacement": float(
-                    cosine_similarity(bp_init, bp_final, eps=1e-30)
-                ),
-            })
-            alignment_records.append({
-                **meta,
-                "layer": l,
-                "alignment": float(
-                    cosine_similarity(pc_final, bp_final, eps=1e-30)
-                ),
-            })
-
-    return (
-        displacement_records,
-        alignment_records,
-        pc_final_kernels,
-        bp_final_kernels,
+    model = MLP(
+        key=key,
+        d_in=input_dim,
+        N=width,
+        L=n_hidden + 1,
+        d_out=output_dim,
+        act_fn=act_fn,
+        param_type=param_type,
+        gamma=gamma_0,
+        use_bias=False,
+        use_skips=use_skips,
     )
+    h_k0_steps = [] if collect_h_k0 else None
+    train_bpn(
+        model=model,
+        use_skips=use_skips,
+        X_input=X_input,
+        Y_target=Y_target,
+        width=width,
+        gamma_0=gamma_0,
+        param_type=param_type,
+        optim_id=param_optim_id,
+        param_lr=param_lr,
+        n_train_iters=n_train_iters,
+        save_dir=save_dir,
+        store_grads=False,
+        loss_id=loss_id,
+        h_k0_steps=h_k0_steps,
+    )
+    losses = np.load(f"{save_dir}/losses.npy")
+    h_k0_traj = np.stack(h_k0_steps, axis=1) if collect_h_k0 else None
+    return losses, h_k0_traj
 
 
 if __name__ == "__main__":
@@ -126,126 +173,100 @@ if __name__ == "__main__":
     # Dataset parameters
     parser.add_argument("--dataset", type=str, default="toy", choices=["toy", "tiny-CIFAR10", "Fashion-MNIST", "CIFAR10"])
     parser.add_argument("--input_dim", type=int, default=40)
-    parser.add_argument("--n_samples", type=int, default=5) # 20)
+    parser.add_argument("--n_samples", type=int, default=20)
 
     # Model parameters
     parser.add_argument("--act_fn", type=str, default="linear", choices=["linear", "tanh", "relu"])
-    parser.add_argument("--param_types", type=str, nargs='+', default=["mupc"], choices=["mupc", "sp", "my-mup"])
-    parser.add_argument("--use_skips", nargs='+', default=[False])
+    parser.add_argument("--param_type", type=str, default="mupc", choices=["mupc", "sp", "my-mup"])
+    parser.add_argument("--use_skips", action="store_true", default=False)
+    parser.add_argument("--n_hidden", type=int, default=5)
+    parser.add_argument("--width", type=int, default=2048)
 
-    # Training parameters
+    # Training parameters (shared)
+    parser.add_argument("--gamma_0", type=float, default=1.0)
+    parser.add_argument("--n_train_iters", type=int, default=20)
+    parser.add_argument("--loss_id", type=str, default="mse", choices=["mse", "ce"])
+
+    # BP training parameters
     parser.add_argument("--param_lr", type=float, default=0.05)
-    parser.add_argument("--gamma_0s", type=float, nargs='+', default=[1])
-    parser.add_argument("--n_train_iters", type=int, default=20) # 100)
-    parser.add_argument("--n_fixed_point_steps", type=int, default=10)
+    parser.add_argument("--param_optim", type=str, default="gd", choices=["gd", "adam"])
 
-    # Inference parameters
+    # PC training / inference parameters
     parser.add_argument("--param_lr_pc", type=float, default=0.5)
-    parser.add_argument("--n_infer_iters", type=int, nargs='+', default=[5])
-    parser.add_argument("--activity_lrs", type=float, nargs='+', default=[0.05])
-
-    # Loop parameters
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--n_seeds", type=int, default=1)
-    parser.add_argument("--n_hiddens", type=int, nargs='+', default=[5])
-
-    # DMFT theory parameters (shared by BP and PC)
+    parser.add_argument(
+        "--pc_infer_mode",
+        type=str,
+        default="infer",
+        choices=["infer", "closed_form"],
+        help=(
+            "PC inference mode. 'infer' runs --n_infer_iters steps of "
+            "gradient descent on the activities each training step. "
+            "'closed_form' solves the linear equilibrium activities "
+            "directly (requires --act_fn linear)."
+        ),
+    )
+    parser.add_argument("--n_infer_iters", type=int, default=5)
+    parser.add_argument("--activity_lr", type=float, default=0.05)
     parser.add_argument(
         "--nonlin_beta",
         type=float,
         default=1.0,
-        help="Steepness for tanh/softplus in nonlinear DMFT theory.",
-    )
-    parser.add_argument(
-        "--num_mc_samples",
-        type=int,
-        default=1000,
-        help="Monte-Carlo samples for nonlinear BP/PC DMFT theory.",
+        help="Steepness for the tanh feature nonlinearity phi.",
     )
 
-    # BP DMFT parameters
+    # Timepoints
     parser.add_argument(
-        "--bp_damping",
-        type=float,
-        default=1.0,
-        help="Kernel mixing factor for nonlinear BP DMFT fixed-point updates.",
+        "--n_timepoints",
+        type=int,
+        default=6,
+        help=(
+            "Number of equally spaced training-step timepoints "
+            "(including t=0 and t=T-1) used for the feature-kernel "
+            "grid, displacement, and alignment-vs-time plots."
+        ),
     )
+
+    # Loop parameters
+    parser.add_argument("--seed", type=int, default=0)
+
     parser.add_argument(
-        "--skip_theory_bp",
+        "--cleanup_npy",
         action="store_true",
-        default=False,
-        help="Skip BP DMFT theory (kernels and loss).",
-    )
-
-    # PC DMFT parameters
-    parser.add_argument(
-        "--pc_damping",
-        type=float,
-        default=1.0,
-        help="Kernel mixing factor for PC DMFT fixed-point updates.",
-    )
-    parser.add_argument(
-        "--pc_tolerance",
-        type=float,
-        default=1e-5,
-        help="Early-stop tolerance for PC DMFT fixed-point residual.",
-    )
-    parser.add_argument(
-        "--pc_backend",
-        type=str,
-        default="optimised",
-        choices=["optimised", "reference"],
+        default=True,
         help=(
-            "PC DMFT linear solver: 'optimised' (default, reduced Delta "
-            "system + jitted Jacobi sweep) or 'reference' (full 2n x 2n "
-            "block system; slower, for debugging)."
+            "After the run, delete finite-sim result directories "
+            "(*_input_dim under results_dir), keeping plot pngs."
         ),
-    )
-    parser.add_argument(
-        "--num_jacobian_samples",
-        type=int,
-        default=None,
-        help=(
-            "MC samples for nonlinear PC response Jacobians "
-            "(default: min(num_mc_samples, 200))."
-        ),
-    )
-    parser.add_argument(
-        "--jacobian_batch_size",
-        type=int,
-        default=25,
-        help="Batch size for nonlinear PC Jacobian samples. Batch size fixed at 50 for BP",
     )
     args = parser.parse_args()
 
-    # PC DMFT inverts (K*T*P) matrices; float64 helps stability.
-    jax.config.update("jax_enable_x64", True)
-
-    os.makedirs(args.results_dir, exist_ok=True)
-    use_nonlin_theory = args.act_fn != "linear"
-    if use_nonlin_theory and args.act_fn == "relu" and not args.skip_theory_bp:
-        raise ValueError(
-            "Nonlinear BP DMFT (solve_kernels_nonlin) supports only "
-            "'tanh' (and softplus in the solver API). Use --act_fn tanh "
-            "or --skip_theory_bp."
+    if args.pc_infer_mode == "closed_form" and args.act_fn != "linear":
+        parser.error(
+            "--pc_infer_mode closed_form requires --act_fn linear."
         )
 
-    data_key, _model_parent, pc_theory_key = jax.random.split(
-        jax.random.PRNGKey(args.seed), 3
-    )
-    bp_theory_key = jax.random.fold_in(pc_theory_key, 1)
+    os.makedirs(args.results_dir, exist_ok=True)
+
+    # Two independent children of --seed: dataset and weight init. PC and
+    # BP weight-init keys are folded from the same parent so neither
+    # reuses the other's (or the data's) randomness.
+    data_key, model_parent = jax.random.split(jax.random.PRNGKey(args.seed))
+    model_key = jax.random.fold_in(model_parent, int(args.seed))
+    pc_key, bp_key = jax.random.split(model_key)
 
     if args.dataset == "toy":
         X, y = create_toy_dataset(
             key=data_key, D=args.input_dim, P=args.n_samples
         )
         input_dim = args.input_dim
+        output_dim = 1
     elif args.dataset == "tiny-CIFAR10":
         input_dim = CIFAR_GRAY_DIM
         X, y = create_tiny_cifar10_dataset(
             key=data_key, D=input_dim, P=args.n_samples
         )
-        print(f"Input dim: {input_dim}")
+        output_dim = 1
+        print(f"Input dim: {input_dim}, Output dim: {output_dim}")
     else:
         from torch import Generator as TorchGenerator
 
@@ -257,337 +278,236 @@ if __name__ == "__main__":
         img_batch, label_batch = next(iter(train_loader))
 
         input_dim = img_batch.shape[1]
-        print(f"Input dim: {input_dim}, Output dim: {label_batch.shape[1]}")
+        output_dim = label_batch.shape[1]
+        print(f"Input dim: {input_dim}, Output dim: {output_dim}")
 
         X = img_batch.numpy().T
         y = label_batch.numpy()
 
-    Kx = jnp.asarray(X.T @ X / input_dim, dtype=jnp.float64)
+    X_input = jnp.asarray(X.T, dtype=jnp.float32)
     Y_target = y[:, None] if y.ndim == 1 else y
-    Y_target = jnp.asarray(Y_target, dtype=jnp.float64)
-    y_bp = (
-        jnp.squeeze(Y_target, axis=-1)
-        if Y_target.ndim == 2 and Y_target.shape[-1] == 1
-        else jnp.asarray(y)
+    Y_target = jnp.asarray(Y_target, dtype=jnp.float32)
+    loss_id = (
+        "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
     )
-    # BP theory does not depend on activity_lr or n_infer_iters; PC theory
-    # is cached across --n_seeds since the dataset is fixed.
-    bp_theory_cache = {}
-    pc_theory_cache = {}
 
-    for seed in range(args.seed, args.seed + args.n_seeds):
-        print(f"\nRunning experiment for seed: {seed}")
+    set_seed(args.seed)
 
-        set_seed(seed)
+    n_hidden = args.n_hidden
+    T_train = args.n_train_iters
+    width = args.width
+    infer_mode = "optim" if args.pc_infer_mode == "infer" else "closed_form"
 
-        displacement_records = []
-        pcbp_alignment_records = []
+    # --- Finite-size PC simulation ---
+    print(
+        f"\nRunning finite-size PC ({args.pc_infer_mode}) simulation "
+        f"(N={width}, H={n_hidden})...\n"
+    )
+    pc_losses, pc_fields = _train_finite_pc(
+        pc_key,
+        results_dir=args.results_dir,
+        input_dim=input_dim,
+        output_dim=output_dim,
+        n_samples=args.n_samples,
+        n_hidden=n_hidden,
+        use_skips=args.use_skips,
+        act_fn=args.act_fn,
+        param_type=args.param_type,
+        param_lr=args.param_lr_pc,
+        gamma_0=args.gamma_0,
+        param_optim_id=args.param_optim,
+        n_train_iters=T_train,
+        infer_mode=infer_mode,
+        n_infer_iters=args.n_infer_iters,
+        activity_lr=args.activity_lr,
+        width=width,
+        loss_id=loss_id,
+        seed=args.seed,
+        X_input=X_input,
+        Y_target=Y_target,
+        collect_fields=False,
+        collect_h_k0=True,
+    )
+    pc_h_traj = pc_fields["h_k0_traj"]  # (n_hidden, T, P, N)
+    print(f"PC final training loss: {float(np.asarray(pc_losses).flatten()[-1]):.4e}")
 
-        for n_hidden in args.n_hiddens:
-            print(f"\n\tn hidden H = {n_hidden}")
+    # --- Finite-size BP simulation ---
+    print(
+        f"\nRunning finite-size BP simulation (N={width}, H={n_hidden})...\n"
+    )
+    bp_losses, bp_h_traj = _train_finite_bp(
+        bp_key,
+        results_dir=args.results_dir,
+        input_dim=input_dim,
+        output_dim=output_dim,
+        n_samples=args.n_samples,
+        n_hidden=n_hidden,
+        use_skips=args.use_skips,
+        act_fn=args.act_fn,
+        param_type=args.param_type,
+        param_lr=args.param_lr,
+        gamma_0=args.gamma_0,
+        param_optim_id=args.param_optim,
+        n_train_iters=T_train,
+        width=width,
+        loss_id=loss_id,
+        seed=args.seed,
+        X_input=X_input,
+        Y_target=Y_target,
+        collect_h_k0=True,
+    )
+    print(f"BP final training loss: {float(np.asarray(bp_losses).flatten()[-1]):.4e}")
 
-            for use_skips in args.use_skips:
-                print(f"\n\t\tuse_skips = {use_skips}")
+    phi_fn, _ = get_nonlinearity(args.act_fn, beta=args.nonlin_beta)
 
-                for gamma_0 in args.gamma_0s:
-                    print(f"\n\t\t\tgamma_0 = {gamma_0}")
+    timepoints = _select_timepoints(T_train, args.n_timepoints)
+    print(f"\nUsing timepoints t = {timepoints} (of T = {T_train})\n")
 
-                    for param_type in args.param_types:
-                        print(f"\n\t\t\t\tparam_type = {param_type}")
+    # Feature kernels (P x P), per layer, at every selected timepoint.
+    pc_kernels_by_t = {
+        t: _feature_kernels_from_h(pc_h_traj[:, t], phi_fn)
+        for t in timepoints
+    }
+    bp_kernels_by_t = {
+        t: _feature_kernels_from_h(bp_h_traj[:, t], phi_fn)
+        for t in timepoints
+    }
 
-                        for activity_lr in args.activity_lrs:
-                            print(f"\n\t\t\t\t\tactivity_lr = {activity_lr}")
+    plots_dir = os.path.join(
+        args.results_dir,
+        "plots",
+        f"{width}_width",
+        f"{args.pc_infer_mode}_pc_infer_mode",
+    )
 
-                            for K_inf in args.n_infer_iters:
-                                print(
-                                    "\n\t\t\t\t\t\tn_infer_iters = "
-                                    f"{K_inf}"
-                                )
+    # --- Feature-kernel grid: one figure per timepoint, top=PC, bottom=BP ---
+    for t in timepoints:
+        plot_final_kernel_grid(
+            [
+                ("PC", pc_kernels_by_t[t]),
+                ("Backprop", bp_kernels_by_t[t]),
+            ],
+            plots_dir=plots_dir,
+            gamma_0=args.gamma_0,
+            n_hidden=n_hidden,
+            activity_lr=args.activity_lr,
+            n_infer_iters=args.n_infer_iters,
+            width=width,
+            filename=f"feature_kernels_grid_t{t}.png",
+            share_clim=True,
+            title=f"Feature kernels ($t={t}$)",
+            dir_name="alignment",
+        )
 
-                                T_train = args.n_train_iters
-                                P = args.n_samples
-                                plots_dir = os.path.join(
-                                    args.results_dir, "plots"
-                                )
+    # --- Kernel displacement from t0 and PC-BP alignment, per layer ---
+    t0 = timepoints[0]
+    displacement_records = []
+    alignment_records = []
+    for t in timepoints:
+        for l in range(n_hidden):
+            displacement_records.append({
+                "t": t,
+                "layer": l,
+                "method": "pc",
+                "displacement": float(
+                    cosine_similarity(
+                        pc_kernels_by_t[t0][l],
+                        pc_kernels_by_t[t][l],
+                        eps=1e-30,
+                    )
+                ),
+            })
+            displacement_records.append({
+                "t": t,
+                "layer": l,
+                "method": "bp",
+                "displacement": float(
+                    cosine_similarity(
+                        bp_kernels_by_t[t0][l],
+                        bp_kernels_by_t[t][l],
+                        eps=1e-30,
+                    )
+                ),
+            })
+            alignment_records.append({
+                "t": t,
+                "layer": l,
+                "alignment": float(
+                    cosine_similarity(
+                        pc_kernels_by_t[t][l],
+                        bp_kernels_by_t[t][l],
+                        eps=1e-30,
+                    )
+                ),
+            })
 
-                                # --- Calculate theory (PC), cached across seeds ---
-                                n_pc = K_inf * T_train * P
-                                pc_key = (
-                                    n_hidden,
-                                    bool(use_skips),
-                                    gamma_0,
-                                    param_type,
-                                    activity_lr,
-                                    K_inf,
-                                )
-                                if pc_key in pc_theory_cache:
-                                    all_Ch, all_Cdelta, pc_dmft_loss = (
-                                        pc_theory_cache[pc_key]
-                                    )
-                                else:
-                                    if use_nonlin_theory:
-                                        print(
-                                            "\t\t\t\t\t\tCalculating nonlinear PC "
-                                            f"Theory (act_fn={args.act_fn}, "
-                                            f"matrix size n = K*T*P = {n_pc})...\n"
-                                        )
-                                        (
-                                            all_Ch,
-                                            all_Cdelta,
-                                            _all_Rh,
-                                            _all_Rdelta,
-                                            _C_delta_top,
-                                            pc_dmft_loss,
-                                            _mean_delta_top,
-                                            pc_diagnostics,
-                                        ) = solve_pc_kernels_nonlin(
-                                            Kx=Kx,
-                                            y=Y_target,
-                                            depth=n_hidden,
-                                            eta=args.param_lr_pc,
-                                            gamma=gamma_0,
-                                            beta_h=activity_lr,
-                                            hidden_energy_scaling=n_hidden + 1,
-                                            num_training_steps=T_train,
-                                            num_inference_steps=K_inf,
-                                            num_fixed_point_steps=args.n_fixed_point_steps,
-                                            num_mc_samples=args.num_mc_samples,
-                                            num_jacobian_samples=args.num_jacobian_samples,
-                                            jacobian_batch_size=args.jacobian_batch_size,
-                                            damping=args.pc_damping,
-                                            nonlinearity=args.act_fn,
-                                            beta=args.nonlin_beta,
-                                            tolerance=args.pc_tolerance,
-                                            key=pc_theory_key,
-                                        )
-                                    else:
-                                        print(
-                                            "\t\t\t\t\t\tCalculating PC Theory "
-                                            f"(matrix size n = K*T*P = {n_pc})...\n"
-                                        )
-                                        (
-                                            all_Ch,
-                                            all_Cdelta,
-                                            _all_Rh,
-                                            _all_Rdelta,
-                                            _C_delta_top,
-                                            pc_dmft_loss,
-                                            _mean_delta_top,
-                                            pc_diagnostics,
-                                        ) = solve_pc_kernels(
-                                            Kx=Kx,
-                                            y=Y_target,
-                                            depth=n_hidden,
-                                            eta=args.param_lr_pc,
-                                            gamma=gamma_0,
-                                            beta_h=activity_lr,
-                                            hidden_energy_scaling=n_hidden + 1,
-                                            num_training_steps=T_train,
-                                            num_inference_steps=K_inf,
-                                            num_fixed_point_steps=args.n_fixed_point_steps,
-                                            damping=args.pc_damping,
-                                            tolerance=args.pc_tolerance,
-                                            backend=args.pc_backend,
-                                        )
-                                    print(
-                                        "\t\t\t\t\t\tPC fixed-point residual = "
-                                        f"{float(pc_diagnostics['fixed_point_residual']):.3e}, "
-                                        "equation residual = "
-                                        f"{float(pc_diagnostics['equation_residual']):.3e} "
-                                        f"after {pc_diagnostics['iterations']} iters\n"
-                                    )
-                                    plot_pc_dmft_kernels_and_loss(
-                                        all_Ch=all_Ch,
-                                        all_Cdelta=all_Cdelta,
-                                        pc_dmft_loss=pc_dmft_loss,
-                                        plots_dir=plots_dir,
-                                        num_inference_steps=K_inf,
-                                        num_training_steps=T_train,
-                                        num_samples=P,
-                                        gamma_0=gamma_0,
-                                        n_hidden=n_hidden,
-                                        activity_lr=activity_lr,
-                                    )
-                                    pc_theory_cache[pc_key] = (
-                                        all_Ch,
-                                        all_Cdelta,
-                                        pc_dmft_loss,
-                                    )
+    plot_kernel_displacement_per_timepoint(
+        pd.DataFrame(displacement_records),
+        plots_dir=plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=args.gamma_0,
+        activity_lr=args.activity_lr,
+        n_infer_iters=args.n_infer_iters,
+        width=width,
+    )
 
-                                # --- Calculate theory (BP), cached since it
-                                # does not depend on activity_lr / K_inf ---
-                                all_H = None
-                                if not args.skip_theory_bp:
-                                    bp_key = (
-                                        n_hidden,
-                                        bool(use_skips),
-                                        gamma_0,
-                                        param_type,
-                                    )
-                                    if bp_key in bp_theory_cache:
-                                        all_H, all_G, dmft_loss = (
-                                            bp_theory_cache[bp_key]
-                                        )
-                                    else:
-                                        if use_nonlin_theory:
-                                            print(
-                                                "\t\t\t\t\t\tCalculating "
-                                                "nonlinear BP Theory "
-                                                f"(act_fn={args.act_fn})...\n"
-                                            )
-                                            all_H, all_G, _, _ = (
-                                                solve_kernels_nonlin(
-                                                    Kx=Kx,
-                                                    y=y_bp,
-                                                    depth=n_hidden,
-                                                    eta=args.param_lr,
-                                                    gamma=gamma_0,
-                                                    T=args.n_train_iters,
-                                                    num_iter=args.n_fixed_point_steps,
-                                                    samples=args.num_mc_samples,
-                                                    damping=args.bp_damping,
-                                                    nonlin=args.act_fn,
-                                                    beta=args.nonlin_beta,
-                                                    key=bp_theory_key,
-                                                )
-                                            )
-                                            Delta_theory = solve_Delta(
-                                                Kx=Kx,
-                                                y=y_bp,
-                                                all_Phi=all_H,
-                                                all_G=all_G,
-                                                eta=args.param_lr,
-                                            )
-                                            dmft_loss = 0.5 * jnp.mean(
-                                                Delta_theory**2, axis=1
-                                            )
-                                        else:
-                                            print(
-                                                "\t\t\t\t\t\tCalculating BP "
-                                                "Theory...\n"
-                                            )
-                                            all_H, all_G, _, _ = solve_kernels(
-                                                Kx=Kx,
-                                                y=y_bp,
-                                                depth=n_hidden,
-                                                eta=args.param_lr,
-                                                gamma=gamma_0,
-                                                T=args.n_train_iters,
-                                                num_steps=args.n_fixed_point_steps
-                                            )
-                                            Delta_theory = get_Delta(
-                                                all_H=all_H,
-                                                all_G=all_G,
-                                                Kx=Kx,
-                                                y=y_bp,
-                                                eta=args.param_lr
-                                            )
-                                            dmft_loss = 0.5 * jnp.mean(
-                                                jnp.sum(
-                                                    Delta_theory**2, axis=2
-                                                ),
-                                                axis=1,
-                                            )
+    plot_pc_bp_alignment_vs_time(
+        pd.DataFrame(alignment_records),
+        plots_dir=plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=args.gamma_0,
+        activity_lr=args.activity_lr,
+        n_infer_iters=args.n_infer_iters,
+        width=width,
+    )
 
-                                        plot_dmft_kernels_and_loss(
-                                            all_H=all_H,
-                                            all_G=all_G,
-                                            dmft_loss=dmft_loss,
-                                            plots_dir=plots_dir,
-                                            gamma_0=gamma_0,
-                                            n_hidden=n_hidden,
-                                        )
-                                        bp_theory_cache[bp_key] = (
-                                            all_H, all_G, dmft_loss
-                                        )
+    # --- Sample-traced temporal kernels (T x T): same grid scheme, one plot ---
+    pc_temporal_kernels = _sample_traced_feature_kernels_from_h_traj(
+        pc_h_traj, phi_fn
+    )
+    bp_temporal_kernels = _sample_traced_feature_kernels_from_h_traj(
+        bp_h_traj, phi_fn
+    )
+    plot_temporal_kernel_grid(
+        [
+            ("PC", pc_temporal_kernels),
+            ("Backprop", bp_temporal_kernels),
+        ],
+        plots_dir=plots_dir,
+        gamma_0=args.gamma_0,
+        n_hidden=n_hidden,
+        activity_lr=args.activity_lr,
+        n_infer_iters=args.n_infer_iters,
+        width=width,
+        filename="temporal_kernels_grid.png",
+        dir_name="alignment",
+    )
 
-                                # --- Kernel displacement / PC-BP alignment ---
-                                sweep_meta = dict(
-                                    n_hidden=n_hidden,
-                                    use_skips=use_skips,
-                                    gamma_0=gamma_0,
-                                    param_type=param_type,
-                                    activity_lr=activity_lr,
-                                    n_infer_iters=K_inf,
-                                )
-                                (
-                                    disp_recs,
-                                    align_recs,
-                                    pc_final_kernels,
-                                    bp_final_kernels,
-                                ) = _alignment_and_displacement_records(
-                                    all_Ch=all_Ch,
-                                    all_H=all_H,
-                                    num_inference_steps=K_inf,
-                                    num_training_steps=T_train,
-                                    num_samples=P,
-                                    **sweep_meta,
-                                )
-                                displacement_records.extend(disp_recs)
-                                pcbp_alignment_records.extend(align_recs)
-
-                                kernel_rows = [("PC", pc_final_kernels)]
-                                if bp_final_kernels is not None:
-                                    kernel_rows.append(
-                                        ("Backprop", bp_final_kernels)
-                                    )
-                                plot_final_kernel_grid(
-                                    kernel_rows,
-                                    plots_dir=plots_dir,
-                                    gamma_0=gamma_0,
-                                    n_hidden=n_hidden,
-                                    activity_lr=activity_lr,
-                                    n_infer_iters=K_inf,
-                                )
-
-        # --- Aggregate displacement / PC-BP alignment plots ---
-        # Grouped so several gamma_0s and/or n_infer_iters values sweep
-        # together on the same axes.
-        plots_dir = os.path.join(args.results_dir, "plots")
-        group_cols = ["n_hidden", "use_skips", "param_type", "activity_lr"]
-        if displacement_records:
-            disp_df = pd.DataFrame(displacement_records)
-            for keys, group in disp_df.groupby(group_cols, dropna=False):
-                n_hidden_k, _use_skips_k, _param_type_k, activity_lr_k = keys
-                plot_kernel_displacement(
-                    group,
-                    plots_dir=plots_dir,
-                    n_hidden=n_hidden_k,
-                    activity_lr=activity_lr_k,
-                )
-        if pcbp_alignment_records:
-            align_df = pd.DataFrame(pcbp_alignment_records)
-            for keys, group in align_df.groupby(group_cols, dropna=False):
-                n_hidden_k, _use_skips_k, _param_type_k, activity_lr_k = keys
-                plot_pc_bp_kernel_alignment(
-                    group,
-                    plots_dir=plots_dir,
-                    n_hidden=n_hidden_k,
-                    activity_lr=activity_lr_k,
-                )
+    if args.cleanup_npy:
+        removed_dirs = cleanup_experiment_dirs(args.results_dir)
+        if removed_dirs:
+            print(
+                f"\nRemoved {len(removed_dirs)} experiment dir(s) "
+                f"under {args.results_dir} (png plots kept):"
+            )
+            for d in removed_dirs:
+                print(f"  - {d}")
+        else:
+            print(f"\nNo *_input_dim dirs to remove under {args.results_dir}.")
 
 
 ######### LINEAR ##########
 ###########################
 
-# Displacement (PC vs BP overlay) + PC–BP alignment + final kernel grid
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hiddens 5 --gamma_0s 1.0 --param_lr 0.1 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# Infer mode (default)
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hidden 5 --width 10000 --gamma_0 1.0 --param_lr 0.1 --param_lr_pc 0.2 --activity_lr 0.01 --pc_infer_mode infer --n_infer_iters 5 --n_train_iters 20
 
-# Displacement / PC–BP alignment across gamma (PC curves only on displacement plot)
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hiddens 5 --gamma_0s 0.1 0.5 1.0 --param_lr 0.1 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
-
-# Displacement / PC–BP alignment across K (PC curves only on displacement plot)
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hiddens 5 --gamma_0s 1.0 --param_lr 0.1 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 10 15 20 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# Closed-form PC inference
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hidden 5 --width 10000 --gamma_0 1.0 --param_lr 0.1 --param_lr_pc 0.2 --pc_infer_mode closed_form --n_train_iters 20
 
 
 ############ NONLINEAR ##################
 #########################################
 
-# Displacement (PC vs BP overlay) + PC–BP alignment + final kernel grid
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 10 --n_hiddens 3 --gamma_0s 1.0 --param_lr 0.5 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --bp_damping 0.5 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
-
-# Displacement / PC–BP alignment across gamma (PC curves only on displacement plot)
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 10 --n_hiddens 3 --gamma_0s 0.1 0.5 1.0 --param_lr 0.5 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --bp_damping 0.5 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
-
-# Displacement / PC–BP alignment across K (PC curves only on displacement plot)
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 10 --n_hiddens 3 --gamma_0s 1.0 --param_lr 0.5 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 10 15 20 --n_train_iters 20 --n_fixed_point_steps 100 --bp_damping 0.5 --pc_damping 0.05 --act_fn tanh --num_mc_samples 1000
+# Infer mode (default)
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 10 --n_hidden 3 --width 10000 --gamma_0 1.0 --param_lr 0.5 --param_lr_pc 1.0 --activity_lr 0.05 --pc_infer_mode infer --n_infer_iters 10 --n_train_iters 30 --act_fn tanh --dataset tiny-CIFAR10
