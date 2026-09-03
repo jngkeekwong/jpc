@@ -1116,6 +1116,135 @@ def plot_pc_k_sweep_displacement(
     return save_path
 
 
+def plot_pc_last_layer_displacement_vs_gamma(
+    displacement_df,
+    plots_dir,
+    n_hidden=None,
+    activity_lr=None,
+    width=None,
+):
+    """Last-hidden-layer displacement vs ``gamma_0``, one curve per ``K``.
+
+    ``displacement_df`` must have columns ``layer``, ``displacement``,
+    ``kind`` (``"dmft"``, ``"infer"``, or ``"closed_form"``),
+    ``n_infer_iters``, and ``gamma_0``. Only the deepest hidden layer
+    (``layer == max(layer)``, i.e. ``ℓ = H``) is drawn. DMFT is the
+    smallest ``K`` (dashed); finite-size infer is solid for increasing
+    ``K``; closed-form is dash-dot in the linear case.
+    """
+    if displacement_df is None or len(displacement_df) == 0:
+        print("No last-layer kernel displacement records to plot.")
+        return None
+
+    last_layer = int(displacement_df["layer"].max())
+    df = displacement_df[displacement_df["layer"] == last_layer]
+    if not len(df):
+        print("No last-layer kernel displacement records to plot.")
+        return None
+
+    plt.figure(figsize=(8, 6))
+    infer_ks = sorted(
+        {
+            int(k)
+            for k in df.loc[
+                df["kind"] == "infer", "n_infer_iters"
+            ].dropna().unique()
+        }
+    )
+    cmap = plt.get_cmap("viridis")
+    k_colors = {
+        k: cmap(i / max(1, len(infer_ks) - 1))
+        for i, k in enumerate(infer_ks)
+    }
+
+    def _xy(sub):
+        sub = sub.sort_values("gamma_0")
+        x = np.asarray(sub["gamma_0"], dtype=float)
+        y = np.asarray(sub["displacement"], dtype=float)
+        return x, y
+
+    dmft_sub = df[df["kind"] == "dmft"]
+    if len(dmft_sub):
+        dmft_k = int(dmft_sub["n_infer_iters"].iloc[0])
+        x, y = _xy(dmft_sub)
+        _warn_if_nonfinite(
+            f"dmft last-layer displacement (K={dmft_k})", y
+        )
+        plt.plot(
+            x,
+            y,
+            color=k_colors.get(dmft_k, "black"),
+            linestyle="--",
+            linewidth=2.0,
+            marker="o",
+            label=rf"theory, $K={dmft_k}$",
+        )
+
+    for k in infer_ks:
+        sub = df[
+            (df["kind"] == "infer")
+            & (df["n_infer_iters"].astype(int) == int(k))
+        ]
+        if not len(sub):
+            continue
+        x, y = _xy(sub)
+        _warn_if_nonfinite(f"infer last-layer displacement (K={k})", y)
+        plt.plot(
+            x,
+            y,
+            color=k_colors[k],
+            linestyle="-",
+            marker="o",
+            markersize=4,
+            alpha=0.85,
+            label=rf"finite infer, $K={k}$",
+        )
+
+    cf_sub = df[df["kind"] == "closed_form"]
+    if len(cf_sub):
+        x, y = _xy(cf_sub)
+        _warn_if_nonfinite("closed-form last-layer displacement", y)
+        plt.plot(
+            x,
+            y,
+            color="black",
+            linestyle="-.",
+            linewidth=2.2,
+            marker="s",
+            markersize=4,
+            label="finite closed-form",
+        )
+
+    plt.xlabel(r"$\gamma_0$")
+    plt.ylabel(
+        rf"$\cos(C^{{\cdot,H}}_{{t=0}}, C^{{\cdot,H}}_{{t=T}})$"
+    )
+    title = rf"Last-layer ($\ell={last_layer + 1}$) feature-kernel displacement"
+    if n_hidden is not None:
+        title += f", $H={int(n_hidden)}$"
+    if width is not None:
+        title += f", $N={int(width)}$"
+    if activity_lr is not None:
+        title += f", activity lr$={activity_lr}$"
+    plt.title(title)
+    plt.ylim(-1.05, 1.05)
+    plt.legend(fontsize=8)
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        activity_lr=activity_lr,
+    )
+    save_path = os.path.join(
+        out_dir, "kernel_displacement_last_layer_vs_gamma.png"
+    )
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"Last-layer displacement vs gamma plot saved to {save_path}")
+    return save_path
+
+
 def plot_pc_bp_kernel_alignment(
     alignment_df,
     plots_dir,

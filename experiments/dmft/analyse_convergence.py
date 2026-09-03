@@ -32,6 +32,11 @@ Loss figures:
   ``C^h``). DMFT is solved and plotted only for the smallest ``K``.
   Linear nets also get one finite-size closed-form curve (independent
   of ``K``).
+- Several ``--n_infer_iters`` and several ``--gamma_0s``: the ``K``-sweep
+  figures above are produced per ``gamma_0``, and one extra plot shows
+  last-hidden-layer (``ℓ = H``) displacement vs ``gamma_0`` with one
+  curve per ``K`` (DMFT at the smallest ``K``, finite infer, closed-form
+  in the linear case). ``--skip_theory`` omits the DMFT curve.
 
 ``--skip_theory`` skips DMFT on the kernel-grid-only path, on loss
 plots, and on the ``K``-sweep kernel grid / displacement (no DMFT row
@@ -85,6 +90,7 @@ from plot_dmft_results import (
     plot_pc_kernel_width_alignment,
     plot_final_kernel_grid,
     plot_pc_k_sweep_displacement,
+    plot_pc_last_layer_displacement_vs_gamma,
 )
 
 
@@ -365,8 +371,13 @@ def _plot_k_sweep_kernels_and_displacement(
     width,
     use_nonlin_theory,
     skip_closed_form,
+    **record_meta,
 ):
-    """Stacked ``K``-sweep kernel grid and per-layer displacement overlay."""
+    """Stacked ``K``-sweep kernel grid and per-layer displacement overlay.
+
+    Returns the displacement records (including ``gamma_0``) so a
+    ``(K, gamma_0)`` last-layer overlay can be drawn later.
+    """
     kernel_rows = []
     if dmft_final is not None:
         kernel_rows.append(
@@ -398,6 +409,13 @@ def _plot_k_sweep_kernels_and_displacement(
             share_clim=True,
         )
 
+    rec_meta = dict(
+        gamma_0=gamma_0,
+        n_hidden=n_hidden,
+        activity_lr=activity_lr,
+        width=width,
+        **record_meta,
+    )
     disp_records = []
     if dmft_init is not None and dmft_final is not None:
         disp_records.extend(
@@ -406,6 +424,7 @@ def _plot_k_sweep_kernels_and_displacement(
                 dmft_final,
                 kind="dmft",
                 n_infer_iters=int(dmft_K),
+                **rec_meta,
             )
         )
     for K in sorted(infer_init):
@@ -415,6 +434,7 @@ def _plot_k_sweep_kernels_and_displacement(
                 infer_final[K],
                 kind="infer",
                 n_infer_iters=int(K),
+                **rec_meta,
             )
         )
     if cf_init is not None and cf_final is not None:
@@ -424,6 +444,7 @@ def _plot_k_sweep_kernels_and_displacement(
                 cf_final,
                 kind="closed_form",
                 n_infer_iters=int(dmft_K) if dmft_K is not None else 0,
+                **rec_meta,
             )
         )
     if disp_records:
@@ -435,6 +456,7 @@ def _plot_k_sweep_kernels_and_displacement(
             activity_lr=activity_lr,
             width=width,
         )
+    return disp_records
 
 
 if __name__ == "__main__":
@@ -703,6 +725,7 @@ if __name__ == "__main__":
 
         theory_records = []
         finite_records = []
+        k_gamma_disp_records = []
 
         for n_hidden in args.n_hiddens:
             print(f"\n\tn hidden H = {n_hidden}")
@@ -1171,24 +1194,30 @@ if __name__ == "__main__":
                                 and seed == kernel_grid_seed
                                 and (not args.skip_finite)
                             ):
-                                _plot_k_sweep_kernels_and_displacement(
-                                    infer_final=k_sweep_infer_final,
-                                    infer_init=k_sweep_infer_init,
-                                    dmft_final=k_sweep_dmft_final,
-                                    dmft_init=k_sweep_dmft_init,
-                                    dmft_K=k_sweep_dmft_K,
-                                    fields_cf=fields_cf,
-                                    phi_fn=phi_fn,
-                                    plots_dir=os.path.join(
-                                        args.results_dir, "plots"
-                                    ),
-                                    gamma_0=gamma_0,
-                                    n_hidden=n_hidden,
-                                    activity_lr=activity_lr,
-                                    width=kernel_plot_width,
-                                    use_nonlin_theory=use_nonlin_theory,
-                                    skip_closed_form=args.skip_closed_form,
+                                disp_recs = (
+                                    _plot_k_sweep_kernels_and_displacement(
+                                        infer_final=k_sweep_infer_final,
+                                        infer_init=k_sweep_infer_init,
+                                        dmft_final=k_sweep_dmft_final,
+                                        dmft_init=k_sweep_dmft_init,
+                                        dmft_K=k_sweep_dmft_K,
+                                        fields_cf=fields_cf,
+                                        phi_fn=phi_fn,
+                                        plots_dir=os.path.join(
+                                            args.results_dir, "plots"
+                                        ),
+                                        gamma_0=gamma_0,
+                                        n_hidden=n_hidden,
+                                        activity_lr=activity_lr,
+                                        width=kernel_plot_width,
+                                        use_nonlin_theory=use_nonlin_theory,
+                                        skip_closed_form=args.skip_closed_form,
+                                        use_skips=use_skips,
+                                        param_type=param_type,
+                                    )
                                 )
+                                if overlay_gamma_0s and disp_recs:
+                                    k_gamma_disp_records.extend(disp_recs)
                             if fields_cf is not None:
                                 del fields_cf
 
@@ -1220,6 +1249,25 @@ if __name__ == "__main__":
                     swept_col="n_infer_iters",
                     plot_closed_form=(not use_nonlin_theory),
                     **sweep_kwargs,
+                )
+
+        if overlay_n_infer_iters and overlay_gamma_0s and k_gamma_disp_records:
+            disp_df = pd.DataFrame(k_gamma_disp_records)
+            group_cols = ["n_hidden", "use_skips", "param_type", "activity_lr"]
+            plots_root = os.path.join(args.results_dir, "plots")
+            for keys, sub in disp_df.groupby(group_cols, dropna=False):
+                n_hidden_k, _use_skips_k, _param_type_k, activity_lr_k = keys
+                width_k = (
+                    int(sub["width"].iloc[0])
+                    if "width" in sub.columns
+                    else None
+                )
+                plot_pc_last_layer_displacement_vs_gamma(
+                    sub,
+                    plots_dir=plots_root,
+                    n_hidden=n_hidden_k,
+                    activity_lr=activity_lr_k,
+                    width=width_k,
                 )
 
     if plot_width:
@@ -1273,6 +1321,9 @@ if __name__ == "__main__":
 # Across K (DMFT only for smallest K; stacked kernel grid + displacement)
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
 
+# Across K and gamma (last-layer displacement vs gamma, curves per K)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+
 # Across widths (convergence of kernels + plot final kernels)
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 500 --pc_damping 0.05 --pc_tolerance 1e-10 --n_seeds 3
 
@@ -1291,6 +1342,9 @@ if __name__ == "__main__":
 
 # Across K (DMFT only for smallest K; stacked kernel grid + displacement)
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 50 100 500 1000 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
+
+# Across K and gamma (last-layer displacement vs gamma, curves per K)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 50 100 500 1000 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
 
 # Across widths (convergence of kernels + plot final kernels)
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --n_seeds 3
