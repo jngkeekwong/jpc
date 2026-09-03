@@ -452,6 +452,7 @@ def _plot_k_sweep_kernels_and_displacement(
             width=width,
             filename="final_pc_kernels_grid.png",
             share_clim=True,
+            dir_name="convergence",
         )
 
     rec_meta = dict(
@@ -500,6 +501,7 @@ def _plot_k_sweep_kernels_and_displacement(
             gamma_0=gamma_0,
             activity_lr=activity_lr,
             width=width,
+            dir_name="convergence",
         )
     return disp_records
 
@@ -1269,6 +1271,7 @@ if __name__ == "__main__":
                                         width=kernel_plot_width,
                                         filename="final_pc_kernels_grid.png",
                                         share_clim=True,
+                                        dir_name="convergence",
                                     )
                                     if (
                                         args.plot_temporal_kernels
@@ -1282,6 +1285,7 @@ if __name__ == "__main__":
                                             activity_lr=activity_lr,
                                             n_infer_iters=K_inf,
                                             width=kernel_plot_width,
+                                            dir_name="convergence",
                                         )
 
                             if (
@@ -1417,6 +1421,7 @@ if __name__ == "__main__":
                     n_hidden=n_hidden_k,
                     activity_lr=activity_lr_k,
                     width=width_k,
+                    dir_name="convergence",
                 )
 
     if plot_width:

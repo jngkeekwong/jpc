@@ -868,6 +868,7 @@ def _alignment_plots_dir(
     gamma_0=None,
     activity_lr=None,
     n_infer_iters=None,
+    dir_name="alignment",
 ):
     if n_hidden is not None:
         plots_dir = os.path.join(plots_dir, f"{n_hidden}_n_hidden")
@@ -877,7 +878,7 @@ def _alignment_plots_dir(
         plots_dir = os.path.join(plots_dir, f"activity_lr_{activity_lr}")
     if n_infer_iters is not None:
         plots_dir = os.path.join(plots_dir, f"{n_infer_iters}_n_infer_iters")
-    plots_dir = os.path.join(plots_dir, "alignment")
+    plots_dir = os.path.join(plots_dir, dir_name)
     os.makedirs(plots_dir, exist_ok=True)
     return plots_dir
 
@@ -1004,6 +1005,7 @@ def plot_pc_k_sweep_displacement(
     gamma_0=None,
     activity_lr=None,
     width=None,
+    dir_name="alignment",
 ):
     """Overlay per-layer feature-kernel displacement for a ``K`` sweep.
 
@@ -1108,6 +1110,7 @@ def plot_pc_k_sweep_displacement(
         n_hidden=n_hidden,
         gamma_0=gamma_0,
         activity_lr=activity_lr,
+        dir_name=dir_name,
     )
     save_path = os.path.join(out_dir, "kernel_displacement_vs_layer.png")
     plt.savefig(save_path, bbox_inches="tight")
@@ -1122,6 +1125,7 @@ def plot_pc_last_layer_displacement_vs_gamma(
     n_hidden=None,
     activity_lr=None,
     width=None,
+    dir_name="alignment",
 ):
     """Last-hidden-layer displacement vs ``gamma_0``, one curve per ``K``.
 
@@ -1235,6 +1239,7 @@ def plot_pc_last_layer_displacement_vs_gamma(
         plots_dir,
         n_hidden=n_hidden,
         activity_lr=activity_lr,
+        dir_name=dir_name,
     )
     save_path = os.path.join(
         out_dir, "kernel_displacement_last_layer_vs_gamma.png"
@@ -1337,6 +1342,8 @@ def plot_final_kernel_grid(
     filename="final_kernels_grid.png",
     share_clim=False,
     title="Final feature kernels",
+    dir_name="alignment",
+    origin="upper",
 ):
     """Grid of feature kernels (one heatmap per layer).
 
@@ -1344,6 +1351,8 @@ def plot_final_kernel_grid(
     ``kernels`` is a sequence of 2-D arrays, one per layer (column),
     typically ``P x P`` (sample-sample) or ``T x T`` (sample-traced).
     When ``share_clim`` is True, every panel uses the same colour limits.
+    ``origin`` is forwarded to ``imshow`` (``"upper"`` puts index ``0``
+    at the top-left; ``"lower"`` puts it at the bottom-left).
     """
     if not kernel_rows:
         raise ValueError("kernel_rows must contain at least one row.")
@@ -1381,7 +1390,9 @@ def plot_final_kernel_grid(
     for r, (label, kernels) in enumerate(rows):
         for l, kernel in enumerate(kernels):
             ax = axes[r, l]
-            ax.imshow(np.asarray(kernel), cmap="coolwarm", **clim_kw)
+            ax.imshow(
+                np.asarray(kernel), cmap="coolwarm", origin=origin, **clim_kw
+            )
             ax.set_xticks([])
             ax.set_yticks([])
             if r == 0:
@@ -1409,6 +1420,7 @@ def plot_final_kernel_grid(
         gamma_0=gamma_0,
         activity_lr=activity_lr,
         n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
     )
     save_path = os.path.join(out_dir, filename)
     fig.savefig(save_path, bbox_inches="tight")
@@ -1427,8 +1439,14 @@ def plot_temporal_kernel_grid(
     width=None,
     filename="temporal_pc_kernels_grid.png",
     share_clim=True,
+    dir_name="alignment",
+    origin="lower",
 ):
-    """Grid of sample-traced (``T x T``) feature kernels at ``k=0``."""
+    """Grid of sample-traced (``T x T``) feature kernels at ``k=0``.
+
+    ``origin="lower"`` (default) places index ``0`` at the bottom-left
+    of each heatmap, i.e. the time axes increase upward/rightward.
+    """
     return plot_final_kernel_grid(
         kernel_rows,
         plots_dir=plots_dir,
@@ -1440,6 +1458,8 @@ def plot_temporal_kernel_grid(
         filename=filename,
         share_clim=share_clim,
         title="Sample-traced feature kernels",
+        dir_name=dir_name,
+        origin=origin,
     )
 
 
