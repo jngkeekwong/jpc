@@ -189,6 +189,48 @@ def final_time_pc_kernel(
     return tensor[k, t, :, k, t, :]
 
 
+def sample_traced_time_kernel(cov_tp):
+    """Reduce a ``(T, P, T, P)`` kernel to ``(T, T)`` by summing the sample diagonal.
+
+    Returns ``C_T[t, t'] = sum_mu C[t, mu, t', mu]``.
+    """
+    arr = np.asarray(cov_tp, dtype=np.float64)
+    if arr.ndim != 4 or arr.shape[0] != arr.shape[2] or arr.shape[1] != arr.shape[3]:
+        raise ValueError(f"expected (T, P, T, P), got {arr.shape}")
+    return np.einsum("tmsm->ts", arr)
+
+
+def sample_traced_pc_kernel(
+    cov, num_inference_steps, num_training_steps, num_samples, k=0
+):
+    """Sample-traced time-time kernel at inference step ``k``.
+
+    Reshapes the flattened ``((K+1)*T*P, (K+1)*T*P)`` covariance and
+    returns ``C_T[t, t'] = sum_mu C[k, t, mu, k, t', mu]``.
+    """
+    K1 = num_inference_steps + 1
+    if not (0 <= k < K1):
+        raise ValueError(
+            f"k={k} is out of range for K={num_inference_steps} "
+            f"(valid 0,...,{num_inference_steps})."
+        )
+    T = num_training_steps
+    P = num_samples
+    tensor = np.asarray(cov, dtype=np.float64).reshape(K1, T, P, K1, T, P)
+    return sample_traced_time_kernel(tensor[k, :, :, k, :, :])
+
+
+def sample_traced_empirical_pc_kernel(field):
+    """Sample-traced ``T x T`` kernel from a field of shape ``(T, P, N)``."""
+    arr = np.asarray(field, dtype=np.float64)
+    if arr.ndim != 3:
+        raise ValueError(f"expected (T, P, N), got {arr.shape}")
+    T, P, _ = arr.shape
+    return sample_traced_time_kernel(
+        empirical_pc_kernel(arr).reshape(T, P, T, P)
+    )
+
+
 def bp_sample_kernel_at(kernel, t=-1):
     """Sample-sample block of a BP feature kernel ``(T, P, T, P)`` at time ``t``.
 
@@ -361,7 +403,8 @@ def train_pcn(
       n_train_iters,
       loss_id,
       save_dir,
-      store_grads=False
+      store_grads=False,
+      h_k0_steps=None,
 ):
     """Train a PC network.
 
@@ -373,7 +416,9 @@ def train_pcn(
     Note that depth includes the output layer here, as opposed to depth in theory_utils.py
 
     Returns ``(pc_grads, model, skip_model)``. ``pc_grads`` is ``None``
-    unless ``store_grads`` is True.
+    unless ``store_grads`` is True. If ``h_k0_steps`` is a list, each
+    training step appends hidden ``h`` at ``k=0`` (feedforward init,
+    before the parameter update) with shape ``(n_hidden, P, N)``.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -413,6 +458,21 @@ def train_pcn(
             param_type=param_type,
             gamma=gamma_0
         )
+        if h_k0_steps is not None:
+            hs_k0, _ = pc_hidden_preactivations_and_errors(
+                model=model,
+                skip_model=skip_model,
+                activities=activities,
+                x=X_input,
+                param_type=param_type,
+                gamma=gamma_0,
+            )
+            h_k0_steps.append(
+                np.stack(
+                    [np.asarray(h, dtype=np.float32) for h in hs_k0],
+                    axis=0,
+                )
+            )
         if loss_id == "mse":
             train_loss = jpc.mse_loss(activities[-1], Y_target)
         else:

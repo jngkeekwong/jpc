@@ -1336,11 +1336,13 @@ def plot_final_kernel_grid(
     width=None,
     filename="final_kernels_grid.png",
     share_clim=False,
+    title="Final feature kernels",
 ):
-    """Grid of final-time sample-sample (``P x P``) feature kernels.
+    """Grid of feature kernels (one heatmap per layer).
 
     ``kernel_rows`` is a list of ``(ylabel, kernels)`` pairs. Each
-    ``kernels`` is a sequence of ``P x P`` arrays, one per layer (column).
+    ``kernels`` is a sequence of 2-D arrays, one per layer (column),
+    typically ``P x P`` (sample-sample) or ``T x T`` (sample-traced).
     When ``share_clim`` is True, every panel uses the same colour limits.
     """
     if not kernel_rows:
@@ -1358,7 +1360,7 @@ def plot_final_kernel_grid(
                 f"row has {n_layers}."
             )
         _warn_if_nonfinite(
-            f"{label} final kernels",
+            f"{label} kernels",
             np.stack([np.asarray(k) for k in kernels]),
         )
         rows.append((label, kernels))
@@ -1387,18 +1389,18 @@ def plot_final_kernel_grid(
             if l == 0:
                 ax.set_ylabel(label)
 
-    title = "Final feature kernels"
+    fig_title = title
     if n_hidden is not None:
-        title += f", $H={int(n_hidden)}$"
+        fig_title += f", $H={int(n_hidden)}$"
     if width is not None:
-        title += f", $N={int(width)}$"
+        fig_title += f", $N={int(width)}$"
     if gamma_0 is not None:
-        title += f", $\\gamma_0={gamma_0}$"
+        fig_title += f", $\\gamma_0={gamma_0}$"
     if activity_lr is not None:
-        title += f", activity lr$={activity_lr}$"
+        fig_title += f", activity lr$={activity_lr}$"
     if n_infer_iters is not None:
-        title += f", $K={int(n_infer_iters)}$"
-    fig.suptitle(title, y=1.02)
+        fig_title += f", $K={int(n_infer_iters)}$"
+    fig.suptitle(fig_title, y=1.02)
     fig.tight_layout()
 
     out_dir = _alignment_plots_dir(
@@ -1411,8 +1413,34 @@ def plot_final_kernel_grid(
     save_path = os.path.join(out_dir, filename)
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
-    print(f"Final feature kernel grid saved to {save_path}")
+    print(f"{title} saved to {save_path}")
     return save_path
+
+
+def plot_temporal_kernel_grid(
+    kernel_rows,
+    plots_dir,
+    gamma_0=None,
+    n_hidden=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    filename="temporal_pc_kernels_grid.png",
+    share_clim=True,
+):
+    """Grid of sample-traced (``T x T``) feature kernels at ``k=0``."""
+    return plot_final_kernel_grid(
+        kernel_rows,
+        plots_dir=plots_dir,
+        gamma_0=gamma_0,
+        n_hidden=n_hidden,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        width=width,
+        filename=filename,
+        share_clim=share_clim,
+        title="Sample-traced feature kernels",
+    )
 
 
 def load_and_plot(results_dir, gamma_0, plots_dir=None, n_hidden=None):

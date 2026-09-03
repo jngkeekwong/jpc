@@ -19,6 +19,11 @@ Kernel / width figures:
   ``both``. Several ``--n_infer_iters`` always add a stacked ``K``-sweep
   kernel grid and a per-layer displacement overlay (see loss figures);
   they do not add extra per-``K`` kernel grids.
+- ``--plot_temporal_kernels``: in addition to the final ``P x P`` grid,
+  plot sample-traced ``T x T`` feature kernels at ``k=0`` (forward
+  init; sample diagonal summed over ``μ``). Requires a single
+  ``--n_hiddens``, ``--gamma_0s``, ``--n_infer_iters``, ``--widths``,
+  and ``--activity_lrs``. Rows match the kernel grid.
 
 Loss figures:
 - Single ``H``, ``gamma_0``, and ``K``: theory vs finite-size loss
@@ -81,6 +86,8 @@ from experiments.dmft.utils import (
     empirical_pc_kernel,
     final_time_pc_kernel,
     pc_hidden_preactivations_and_errors,
+    sample_traced_empirical_pc_kernel,
+    sample_traced_pc_kernel,
 )
 from theory_pc_utils import solve_pc_kernels
 from theory_pc_nonlin_utils import solve_pc_kernels_nonlin, get_nonlinearity
@@ -89,6 +96,7 @@ from plot_dmft_results import (
     plot_pc_param_sweep_loss,
     plot_pc_kernel_width_alignment,
     plot_final_kernel_grid,
+    plot_temporal_kernel_grid,
     plot_pc_k_sweep_displacement,
     plot_pc_last_layer_displacement_vs_gamma,
 )
@@ -118,13 +126,16 @@ def _train_finite_pc(
     X_input,
     Y_target,
     collect_fields=True,
+    collect_h_k0=False,
 ):
     """Run one finite-width PC training job.
 
     Returns the loss trajectory and, when ``collect_fields`` is True,
     hidden ``h`` at ``k=0`` / ``Δ`` at the last inference step
     ``k=n_infer_iters`` of the trained network, plus untrained
-    feedforward ``h_init`` (else ``None``).
+    feedforward ``h_init`` (else ``None``). When ``collect_h_k0`` is
+    True, ``fields["h_k0_traj"]`` is hidden ``h`` at ``k=0`` of every
+    training step, shape ``(n_hidden, T, P, N)``.
     """
     save_dir = setup_pc_experiment(
         results_dir=results_dir,
@@ -176,6 +187,7 @@ def _train_finite_pc(
         h_init = np.stack(
             [np.asarray(h, dtype=np.float32) for h in hs_init], axis=0
         )
+    h_k0_steps = [] if collect_h_k0 else None
     _, model, skip_model = train_pcn(
         model=model,
         use_skips=use_skips,
@@ -193,23 +205,28 @@ def _train_finite_pc(
         save_dir=save_dir,
         store_grads=False,
         loss_id=loss_id,
+        h_k0_steps=h_k0_steps,
     )
     losses = np.load(f"{save_dir}/train_losses.npy")
-    if not collect_fields:
+    if not collect_fields and not collect_h_k0:
         return losses, None
-    fields = collect_final_pc_kernel_fields(
-        model=model,
-        skip_model=skip_model,
-        X_input=X_input,
-        Y_target=Y_target,
-        width=width,
-        param_type=param_type,
-        gamma_0=gamma_0,
-        activity_lr=activity_lr,
-        loss_id=loss_id,
-        n_infer_iters=n_infer_iters,
-    )
-    fields["h_init"] = h_init
+    fields = {}
+    if collect_fields:
+        fields = collect_final_pc_kernel_fields(
+            model=model,
+            skip_model=skip_model,
+            X_input=X_input,
+            Y_target=Y_target,
+            width=width,
+            param_type=param_type,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+            loss_id=loss_id,
+            n_infer_iters=n_infer_iters,
+        )
+        fields["h_init"] = h_init
+    if collect_h_k0:
+        fields["h_k0_traj"] = np.stack(h_k0_steps, axis=1)
     return losses, fields
 
 
@@ -354,6 +371,34 @@ def _final_dmft_feature_kernels(
         num_samples,
         t=-1,
     )
+
+
+def _sample_traced_feature_kernels_from_h_traj(h_traj, phi_fn):
+    """Sample-traced ``T x T`` ``C^h`` at ``k=0`` for every hidden layer.
+
+    ``h_traj`` has shape ``(n_hidden, T, P, N)``.
+    """
+    kernels = []
+    for l in range(h_traj.shape[0]):
+        phi_l = np.asarray(phi_fn(jnp.asarray(h_traj[l])))
+        kernels.append(sample_traced_empirical_pc_kernel(phi_l))
+    return kernels
+
+
+def _dmft_sample_traced_feature_kernels(
+    all_Ch, num_inference_steps, num_training_steps, num_samples, k=0
+):
+    """DMFT sample-traced ``T x T`` ``C^h`` at inference step ``k``."""
+    return [
+        sample_traced_pc_kernel(
+            Ch_l,
+            num_inference_steps=num_inference_steps,
+            num_training_steps=num_training_steps,
+            num_samples=num_samples,
+            k=k,
+        )
+        for Ch_l in all_Ch
+    ]
 
 
 def _plot_k_sweep_kernels_and_displacement(
@@ -508,6 +553,18 @@ if __name__ == "__main__":
             "'both' solves DMFT once then draws both figures."
         ),
     )
+    parser.add_argument(
+        "--plot_temporal_kernels",
+        action="store_true",
+        default=False,
+        help=(
+            "In addition to the final P x P kernel grid, plot sample-traced "
+            "T x T feature kernels at k=0 (forward init; sample diagonal "
+            "summed over mu). Requires a single --n_hiddens, --gamma_0s, "
+            "--n_infer_iters, --widths, and --activity_lrs. Rows match the "
+            "kernel grid. --skip_theory drops the DMFT row."
+        ),
+    )
 
     # PC DMFT theory parameters
     parser.add_argument(
@@ -653,10 +710,33 @@ if __name__ == "__main__":
     skip_loss_theory = args.skip_theory and not plot_width
     skip_closed_form = args.skip_closed_form and plot_kernels
     explicit_kernel_mode = args.plot_mode in ("kernels", "width", "both")
+    if args.plot_temporal_kernels:
+        if args.skip_finite:
+            parser.error(
+                "--plot_temporal_kernels requires finite-size simulations."
+            )
+        if not plot_kernels:
+            parser.error(
+                "--plot_temporal_kernels is drawn with the kernel grid; "
+                "use --plot_mode kernels or both (or auto with one width)."
+            )
+        single_valued = (
+            len(args.n_hiddens) == 1
+            and len(args.gamma_0s) == 1
+            and len(args.n_infer_iters) == 1
+            and len(args.widths) == 1
+            and len(args.activity_lrs) == 1
+        )
+        if not single_valued:
+            parser.error(
+                "--plot_temporal_kernels requires a single --n_hiddens, "
+                "--gamma_0s, --n_infer_iters, --widths, and --activity_lrs."
+            )
     min_K = min(args.n_infer_iters)
     print(
         f"plot_mode={args.plot_mode} "
         f"(kernels={plot_kernels}, width={plot_width}); "
+        f"plot_temporal_kernels={args.plot_temporal_kernels}; "
         f"overlay_any={overlay_any}; "
         f"skip_theory={skip_kernel_theory}; "
         f"skip_finite={args.skip_finite}; "
@@ -943,6 +1023,7 @@ if __name__ == "__main__":
                                 # --- Finite-size PC simulation (infer) ---
                                 finite_pc_records = []
                                 infer_feature_kernels = None
+                                infer_temporal_kernels = None
                                 if not args.skip_finite:
                                     print(
                                         "\t\t\t\t\tRunning finite-size PC simulation "
@@ -976,6 +1057,12 @@ if __name__ == "__main__":
                                             X_input=X_input,
                                             Y_target=Y_target,
                                             collect_fields=collect_fields,
+                                            collect_h_k0=(
+                                                args.plot_temporal_kernels
+                                                and kernels_this_K
+                                                and seed == kernel_grid_seed
+                                                and width == kernel_plot_width
+                                            ),
                                         )
                                         recs = _loss_records(
                                             losses,
@@ -1014,6 +1101,18 @@ if __name__ == "__main__":
                                                     fields, phi_fn
                                                 )
                                             )
+                                            if (
+                                                args.plot_temporal_kernels
+                                                and fields is not None
+                                                and fields.get("h_k0_traj")
+                                                is not None
+                                            ):
+                                                infer_temporal_kernels = (
+                                                    _sample_traced_feature_kernels_from_h_traj(
+                                                        fields["h_k0_traj"],
+                                                        phi_fn,
+                                                    )
+                                                )
                                         if (
                                             k_sweep_this
                                             and width == kernel_plot_width
@@ -1060,6 +1159,7 @@ if __name__ == "__main__":
                                     and seed == kernel_grid_seed
                                 ):
                                     closed_form_feature_kernels = None
+                                    closed_form_temporal_kernels = None
                                     if (
                                         not use_nonlin_theory
                                         and not skip_closed_form
@@ -1092,15 +1192,28 @@ if __name__ == "__main__":
                                             seed=seed,
                                             X_input=X_input,
                                             Y_target=Y_target,
+                                            collect_h_k0=args.plot_temporal_kernels,
                                         )
                                         closed_form_feature_kernels = (
                                             _final_feature_kernels(
                                                 fields_cf, phi_fn
                                             )
                                         )
+                                        if (
+                                            args.plot_temporal_kernels
+                                            and fields_cf.get("h_k0_traj")
+                                            is not None
+                                        ):
+                                            closed_form_temporal_kernels = (
+                                                _sample_traced_feature_kernels_from_h_traj(
+                                                    fields_cf["h_k0_traj"],
+                                                    phi_fn,
+                                                )
+                                            )
                                         del fields_cf
 
                                     kernel_rows = []
+                                    temporal_rows = []
                                     if closed_form_feature_kernels is not None:
                                         kernel_rows.append(
                                             (
@@ -1108,9 +1221,20 @@ if __name__ == "__main__":
                                                 closed_form_feature_kernels,
                                             )
                                         )
+                                    if closed_form_temporal_kernels is not None:
+                                        temporal_rows.append(
+                                            (
+                                                "Closed-form",
+                                                closed_form_temporal_kernels,
+                                            )
+                                        )
                                     kernel_rows.append(
                                         ("Infer", infer_feature_kernels)
                                     )
+                                    if infer_temporal_kernels is not None:
+                                        temporal_rows.append(
+                                            ("Infer", infer_temporal_kernels)
+                                        )
                                     if all_Ch is not None:
                                         kernel_rows.append(
                                             (
@@ -1123,6 +1247,18 @@ if __name__ == "__main__":
                                                 ),
                                             )
                                         )
+                                        if args.plot_temporal_kernels:
+                                            temporal_rows.append(
+                                                (
+                                                    "DMFT",
+                                                    _dmft_sample_traced_feature_kernels(
+                                                        all_Ch,
+                                                        num_inference_steps=K_inf,
+                                                        num_training_steps=T_train,
+                                                        num_samples=P,
+                                                    ),
+                                                )
+                                            )
                                     plot_final_kernel_grid(
                                         kernel_rows,
                                         plots_dir=plots_dir,
@@ -1134,6 +1270,19 @@ if __name__ == "__main__":
                                         filename="final_pc_kernels_grid.png",
                                         share_clim=True,
                                     )
+                                    if (
+                                        args.plot_temporal_kernels
+                                        and temporal_rows
+                                    ):
+                                        plot_temporal_kernel_grid(
+                                            temporal_rows,
+                                            plots_dir=plots_dir,
+                                            gamma_0=gamma_0,
+                                            n_hidden=n_hidden,
+                                            activity_lr=activity_lr,
+                                            n_infer_iters=K_inf,
+                                            width=kernel_plot_width,
+                                        )
 
                             if (
                                 overlay_n_infer_iters
@@ -1309,42 +1458,48 @@ if __name__ == "__main__":
 ######### LINEAR ##########
 ###########################
 
-# Plot final feature kernels, finite-size only (no DMFT row)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --plot_mode kernels --skip_theory --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# Single (final P x P kernels + sample-traced T x T kernels)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --plot_temporal_kernels --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --results_dir results_S
+
+# Single (final finite-size P x P kernels only; no DMFT row) for testing
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --skip_theory --results_dir results_T
 
 # Across depth
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 2 3 4 5  --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 2 3 4 5  --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --results_dir results_D
 
 # Across gamma
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --results_dir results_G
 
 # Across K (DMFT only for smallest K; stacked kernel grid + displacement)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --results_dir results_K
 
 # Across K and gamma (last-layer displacement vs gamma, curves per K)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --results_dir results_KG
 
 # Across widths (convergence of kernels + plot final kernels)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 500 --pc_damping 0.05 --pc_tolerance 1e-10 --n_seeds 3
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 500 --pc_damping 0.05 --pc_tolerance 1e-10 --n_seeds 3 --results_dir results_W
 
 
 ############ NONLINEAR ##################
 #########################################
 
-# Plot final feature kernels, finite-size only (no DMFT row)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --plot_mode kernels --skip_theory --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
+# Single (final P x P kernels + sample-traced T x T kernels)
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --plot_temporal_kernels --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --results_dir results_nonlin_S
+
+# Single (final finite-size P x P kernels only; no DMFT row) for testing
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --skip_theory --results_dir results_nonlin_T
 
 # Across depth
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 1 2 3  --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 1 2 3  --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --results_dir results_nonlin_D
 
 # Across gamma
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --results_dir results_nonlin_G
 
 # Across K (DMFT only for smallest K; stacked kernel grid + displacement)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 50 100 500 1000 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 50 100 500 1000 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --results_dir results_nonlin_K
 
 # Across K and gamma (last-layer displacement vs gamma, curves per K)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 50 100 500 1000 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 50 100 500 1000 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --results_dir results_nonlin_KG
 
 # Across widths (convergence of kernels + plot final kernels)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --n_seeds 3
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 8 --n_hiddens 3 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 1.0 --activity_lrs 0.05 --n_infer_iters 10 --n_train_iters 30 --n_fixed_point_steps 100 --pc_damping 0.05 --act_fn tanh --dataset tiny-CIFAR10 --n_seeds 3 --results_dir results_nonlin_W
