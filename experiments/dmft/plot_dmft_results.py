@@ -41,11 +41,16 @@ def _feature_kernel_tex(symbol):
     return r"\phi" if symbol == "phi" else "h"
 
 
-def _data_ylim(values, *, invert=False, pad_frac=0.08, min_pad=0.02):
+def _data_ylim(
+    values, *, invert=False, pad_frac=0.08, min_pad=0.02, ymin_floor=None
+):
     """Tight y-limits around ``values``, with optional inverted axis.
 
     ``invert=True`` puts smaller values at the top (so relative
     displacement 0 matches cosine/CKA ``1`` at the top).
+    If ``ymin_floor`` is set and every finite value is at least that
+    floor, the lower limit is that floor (e.g. 0 for CKA / cosine);
+    otherwise the padded data range is kept.
     """
     v = np.asarray(values, dtype=float).reshape(-1)
     v = v[np.isfinite(v)]
@@ -55,6 +60,12 @@ def _data_ylim(values, *, invert=False, pad_frac=0.08, min_pad=0.02):
     hi = float(np.max(v))
     pad = max((hi - lo) * pad_frac, min_pad)
     lo, hi = lo - pad, hi + pad
+    if (
+        ymin_floor is not None
+        and not invert
+        and float(np.min(v)) >= ymin_floor
+    ):
+        lo = float(ymin_floor)
     if invert:
         return (hi, lo)
     return (lo, hi)
@@ -88,8 +99,11 @@ def _displacement_plot_filename(cosine_name, metric):
     if metric == "cosine":
         return cosine_name
     if metric == "rel_frob":
-        if cosine_name == "kernel_displacement_vs_time.png":
-            return "kernel_displacement_rel_vs_time.png"
+        stem, ext = os.path.splitext(cosine_name)
+        if stem.endswith("_vs_time"):
+            return f"{stem[:-8]}_rel_vs_time{ext}"
+        if stem.endswith("_vs_loss"):
+            return f"{stem[:-8]}_rel_vs_loss{ext}"
         return cosine_name.replace(
             "kernel_displacement", "kernel_rel_displacement", 1
         )
@@ -99,6 +113,19 @@ def _displacement_plot_filename(cosine_name, metric):
 def _maybe_set_ylim(ax, ylim):
     if ylim is not None:
         ax.set_ylim(*ylim)
+
+
+def _markersize_for_n(n):
+    return 3.5 if n > 20 else 6
+
+
+def _apply_x_axis(ax, *, xlabel, xscale="linear", invert_x=False):
+    """Set xlabel / xscale; invert at most once (safe with shared axes)."""
+    ax.set_xlabel(xlabel)
+    if xscale == "log" and ax.get_xscale() != "log":
+        ax.set_xscale("log")
+    if invert_x and not ax.xaxis_inverted():
+        ax.invert_xaxis()
 
 
 def plot_dmft_loss(dmft_loss, plots_dir, gamma_0=None):
@@ -1097,7 +1124,9 @@ def plot_kernel_displacement(
     plt.title(title)
     _maybe_set_ylim(
         plt.gca(),
-        _data_ylim(displacement_df["displacement"], invert=False),
+        _data_ylim(
+            displacement_df["displacement"], invert=False, ymin_floor=0.0
+        ),
     )
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.4)
@@ -1260,18 +1289,27 @@ def plot_kernel_displacement_per_timepoint(
     dir_name="alignment",
     feature_symbol="h",
     metric="cosine",
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
+    filename="kernel_displacement_vs_time.png",
+    t_sub="t",
 ):
-    """Per-layer feature-kernel displacement from ``t0`` vs training time.
+    """Per-layer feature-kernel displacement from ``t0`` vs ``x_col``.
 
-    ``displacement_df`` must have columns ``t``, ``layer``, ``method``
+    ``displacement_df`` must have columns ``x_col``, ``layer``, ``method``
     (``"pc"`` or ``"bp"``), and ``displacement`` (cosine similarity of
-    the kernel at ``t`` vs ``t0``) or ``rel_displacement`` (relative
-    Frobenius), selected by ``metric``.     One subplot per hidden layer, x-axis is ``t``. For three or fewer
-    layers the panels are arranged in a single row; otherwise an auto
-    grid is used. Saved as ``kernel_displacement_vs_time.png``
-    (cosine) or ``kernel_displacement_rel_vs_time.png``.
+    the kernel at the current point vs ``t0``) or ``rel_displacement``
+    (relative Frobenius), selected by ``metric``. One subplot per hidden
+    layer. For three or fewer layers the panels are arranged in a single
+    row; otherwise an auto grid is used. Saved as ``filename`` (cosine)
+    or the matching ``*_rel_vs_*`` name.
 
     ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
+    ``t_sub`` is the TeX subscript for the current kernel (``t`` or
+    ``L``). High-to-low loss axes should pass ``invert_x=True`` so
+    training still reads left to right.
     """
     if displacement_df is None or len(displacement_df) == 0:
         print("No kernel displacement records to plot.")
@@ -1294,11 +1332,14 @@ def plot_kernel_displacement_per_timepoint(
         ncols = int(np.ceil(np.sqrt(n_l)))
         nrows = int(np.ceil(n_l / ncols))
     value_col, ylabel, invert = _displacement_metric_spec(
-        metric, feature_symbol, t0="t_0", t="t", layer=r"\ell"
+        metric, feature_symbol, t0="t_0", t=t_sub, layer=r"\ell"
     )
-    ylim = _data_ylim(displacement_df[value_col], invert=invert)
-    n_t = displacement_df["t"].nunique()
-    markersize = 3.5 if n_t > 20 else 6
+    ylim = _data_ylim(
+        displacement_df[value_col],
+        invert=invert,
+        ymin_floor=0.0 if metric == "cosine" else None,
+    )
+    markersize = _markersize_for_n(displacement_df[x_col].nunique())
 
     fig, axes = plt.subplots(
         nrows,
@@ -1311,39 +1352,18 @@ def plot_kernel_displacement_per_timepoint(
     for i, layer in enumerate(layers):
         ax = axes[i // ncols, i % ncols]
         sub = displacement_df[displacement_df["layer"] == layer]
-
-        pc_sub = sub[sub["method"] == "pc"].sort_values("t")
-        if len(pc_sub):
-            t = np.asarray(pc_sub["t"], dtype=float)
-            values = np.asarray(pc_sub[value_col], dtype=float)
-            _warn_if_nonfinite(f"pc displacement (layer={layer})", values)
-            ax.plot(
-                t,
-                values,
-                marker="o",
-                markersize=markersize,
-                color="tab:blue",
-                label="PC",
-            )
-
-        bp_sub = sub[sub["method"] == "bp"].sort_values("t")
-        if len(bp_sub):
-            t = np.asarray(bp_sub["t"], dtype=float)
-            values = np.asarray(bp_sub[value_col], dtype=float)
-            _warn_if_nonfinite(f"bp displacement (layer={layer})", values)
-            ax.plot(
-                t,
-                values,
-                marker="s",
-                markersize=markersize,
-                color="tab:orange",
-                label="Backprop",
-            )
-
+        _plot_pc_bp_series(
+            ax,
+            sub,
+            x_col=x_col,
+            value_col=value_col,
+            markersize=markersize,
+            label_prefix=f"displacement (layer={layer}) ",
+        )
         ax.set_title(rf"$\ell = {int(layer) + 1}$")
-        ax.set_xlabel("$t$")
+        _apply_x_axis(ax, xlabel=xlabel, xscale=xscale, invert_x=invert_x)
         _maybe_set_ylim(ax, ylim)
-        ax.grid(True, alpha=0.4)
+        ax.grid(True, alpha=0.4, which="both" if xscale == "log" else "major")
         if i % ncols == 0:
             ax.set_ylabel(ylabel)
         if i == 0:
@@ -1357,25 +1377,18 @@ def plot_kernel_displacement_per_timepoint(
         if metric == "rel_frob"
         else "Feature-kernel displacement from $t_0$"
     )
-    if n_hidden is not None:
-        fig_title += f", $H={int(n_hidden)}$"
-    if width is not None:
-        fig_title += f", $N={int(width)}$"
-    if gamma_0 is not None:
-        fig_title += f", $\\gamma_0={gamma_0}$"
-    if activity_lr is not None:
-        fig_title += f", activity lr$={activity_lr}$"
+    fig_title += _fig_param_suffix(
+        n_hidden=n_hidden, width=width, gamma_0=gamma_0, activity_lr=activity_lr
+    )
     fig.suptitle(fig_title, y=1.02)
     fig.tight_layout()
     save_path = os.path.join(
         out_dir,
-        _displacement_plot_filename(
-            "kernel_displacement_vs_time.png", metric
-        ),
+        _displacement_plot_filename(filename, metric),
     )
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
-    print(f"Kernel displacement vs time saved to {save_path}")
+    print(f"Kernel displacement plot saved to {save_path}")
     return save_path
 
 
@@ -1452,12 +1465,17 @@ def plot_pc_bp_metric_vs_time(
     width=None,
     dir_name="alignment",
     invert_ylim=False,
+    ymin_floor=None,
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
 ):
-    """Per-layer PC vs backprop line plot vs training time ``t``.
+    """Per-layer PC vs backprop line plot vs ``x_col``.
 
     Same layout as ``plot_kernel_displacement_per_timepoint``: one
     subplot per hidden layer, blue circles for PC and orange squares
-    for backprop. ``metric_df`` must have columns ``t``, ``layer``,
+    for backprop. ``metric_df`` must have columns ``x_col``, ``layer``,
     ``method`` (``"pc"`` or ``"bp"``), and ``value_col``.
     """
     if metric_df is None or len(metric_df) == 0:
@@ -1474,9 +1492,10 @@ def plot_pc_bp_metric_vs_time(
     )
     layers = sorted(metric_df["layer"].unique())
     n_l = len(layers)
-    ylim = _data_ylim(metric_df[value_col], invert=invert_ylim)
-    n_t = metric_df["t"].nunique()
-    markersize = 3.5 if n_t > 20 else 6
+    ylim = _data_ylim(
+        metric_df[value_col], invert=invert_ylim, ymin_floor=ymin_floor
+    )
+    markersize = _markersize_for_n(metric_df[x_col].nunique())
 
     fig, axes, nrows, ncols = _per_layer_axes(n_l)
     for i, layer in enumerate(layers):
@@ -1485,15 +1504,15 @@ def plot_pc_bp_metric_vs_time(
         _plot_pc_bp_series(
             ax,
             sub,
-            x_col="t",
+            x_col=x_col,
             value_col=value_col,
             markersize=markersize,
             label_prefix=f"{value_col} (layer={layer}) ",
         )
         ax.set_title(rf"$\ell = {int(layer) + 1}$")
-        ax.set_xlabel("$t$")
+        _apply_x_axis(ax, xlabel=xlabel, xscale=xscale, invert_x=invert_x)
         _maybe_set_ylim(ax, ylim)
-        ax.grid(True, alpha=0.4)
+        ax.grid(True, alpha=0.4, which="both" if xscale == "log" else "major")
         if i % ncols == 0:
             ax.set_ylabel(ylabel)
         if i == 0:
@@ -1513,6 +1532,15 @@ def plot_pc_bp_metric_vs_time(
     return save_path
 
 
+def _axis_kwargs(x_col, xlabel, xscale, invert_x, ymin_floor=None):
+    kw = dict(
+        x_col=x_col, xlabel=xlabel, xscale=xscale, invert_x=invert_x
+    )
+    if ymin_floor is not None:
+        kw["ymin_floor"] = ymin_floor
+    return kw
+
+
 def plot_kernel_target_alignment_vs_time(
     alignment_df,
     plots_dir,
@@ -1523,28 +1551,36 @@ def plot_kernel_target_alignment_vs_time(
     width=None,
     dir_name="alignment",
     feature_symbol="h",
+    ylabel=None,
+    filename="kernel_target_alignment_vs_time.png",
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
 ):
     """Per-layer CKA of PC / BP feature kernels with the target kernel.
 
-    ``alignment_df`` must have columns ``t``, ``layer``, ``method``,
+    ``alignment_df`` must have columns ``x_col``, ``layer``, ``method``,
     and ``alignment``. The target kernel is ``C^y = Y Y^T``.
     """
     sym = _feature_kernel_tex(feature_symbol)
+    arg = {"t": "t", "loss": "L"}.get(x_col, x_col)
+    if ylabel is None:
+        ylabel = rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}({arg}), C^{{y}})$"
     return plot_pc_bp_metric_vs_time(
         alignment_df,
         plots_dir,
         value_col="alignment",
-        ylabel=(
-            rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}(t), C^{{y}})$"
-        ),
+        ylabel=ylabel,
         title="Feature-kernel alignment with the target",
-        filename="kernel_target_alignment_vs_time.png",
+        filename=filename,
         n_hidden=n_hidden,
         gamma_0=gamma_0,
         activity_lr=activity_lr,
         n_infer_iters=n_infer_iters,
         width=width,
         dir_name=dir_name,
+        **_axis_kwargs(x_col, xlabel, xscale, invert_x, ymin_floor=0.0),
     )
 
 
@@ -1558,28 +1594,38 @@ def plot_kernel_target_change_alignment_vs_time(
     width=None,
     dir_name="alignment",
     feature_symbol="h",
+    ylabel=None,
+    filename="kernel_target_change_alignment_vs_time.png",
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
 ):
     """Per-layer CKA of PC / BP kernel *changes* with the target kernel.
 
-    ``alignment_df`` must have columns ``t``, ``layer``, ``method``,
-    and ``alignment``. ``t=0`` should be omitted (``ΔC=0``).
+    ``alignment_df`` must have columns ``x_col``, ``layer``, ``method``,
+    and ``alignment``. The init point should be omitted (``ΔC=0``).
     """
     sym = _feature_kernel_tex(feature_symbol)
+    arg = {"t": "t", "loss": "L"}.get(x_col, x_col)
+    if ylabel is None:
+        ylabel = (
+            rf"$\mathrm{{CKA}}(\Delta C^{{{sym},\ell}}({arg}), C^{{y}})$"
+        )
     return plot_pc_bp_metric_vs_time(
         alignment_df,
         plots_dir,
         value_col="alignment",
-        ylabel=(
-            rf"$\mathrm{{CKA}}(\Delta C^{{{sym},\ell}}(t), C^{{y}})$"
-        ),
+        ylabel=ylabel,
         title="Feature-kernel change alignment with the target",
-        filename="kernel_target_change_alignment_vs_time.png",
+        filename=filename,
         n_hidden=n_hidden,
         gamma_0=gamma_0,
         activity_lr=activity_lr,
         n_infer_iters=n_infer_iters,
         width=width,
         dir_name=dir_name,
+        **_axis_kwargs(x_col, xlabel, xscale, invert_x, ymin_floor=0.0),
     )
 
 
@@ -1593,28 +1639,36 @@ def plot_kernel_input_alignment_vs_time(
     width=None,
     dir_name="alignment",
     feature_symbol="h",
+    ylabel=None,
+    filename="kernel_input_alignment_vs_time.png",
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
 ):
     """Per-layer CKA of PC / BP feature kernels with the input kernel.
 
-    ``alignment_df`` must have columns ``t``, ``layer``, ``method``,
+    ``alignment_df`` must have columns ``x_col``, ``layer``, ``method``,
     and ``alignment``. The input kernel is ``C^x = X X^T``.
     """
     sym = _feature_kernel_tex(feature_symbol)
+    arg = {"t": "t", "loss": "L"}.get(x_col, x_col)
+    if ylabel is None:
+        ylabel = rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}({arg}), C^{{x}})$"
     return plot_pc_bp_metric_vs_time(
         alignment_df,
         plots_dir,
         value_col="alignment",
-        ylabel=(
-            rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}(t), C^{{x}})$"
-        ),
+        ylabel=ylabel,
         title="Feature-kernel alignment with the input",
-        filename="kernel_input_alignment_vs_time.png",
+        filename=filename,
         n_hidden=n_hidden,
         gamma_0=gamma_0,
         activity_lr=activity_lr,
         n_infer_iters=n_infer_iters,
         width=width,
         dir_name=dir_name,
+        **_axis_kwargs(x_col, xlabel, xscale, invert_x, ymin_floor=0.0),
     )
 
 
@@ -1629,27 +1683,34 @@ def plot_leading_evec_label_overlap_vs_time(
     dir_name="alignment",
     feature_symbol="h",
     ylabel=None,
+    filename="evec_leading_overlap_label_vs_time.png",
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
 ):
     """Per-layer overlap of the centered leading eigenvector with labels.
 
-    ``overlap_df`` must have columns ``t``, ``layer``, ``method``, and
-    ``overlap``. Default ylabel is ``|cos(v_1, y)|``.
+    ``overlap_df`` must have columns ``x_col``, ``layer``, ``method``,
+    and ``overlap``. Default ylabel is ``|cos(v_1, y)|``.
     """
+    arg = {"t": "t", "loss": "L"}.get(x_col, x_col)
     if ylabel is None:
-        ylabel = r"$\left|\cos(v_1^{\ell}(t), y)\right|$"
+        ylabel = rf"$\left|\cos(v_1^{{\ell}}({arg}), y)\right|$"
     return plot_pc_bp_metric_vs_time(
         overlap_df,
         plots_dir,
         value_col="overlap",
         ylabel=ylabel,
         title="Leading-eigenvector overlap with the labels",
-        filename="evec_leading_overlap_label_vs_time.png",
+        filename=filename,
         n_hidden=n_hidden,
         gamma_0=gamma_0,
         activity_lr=activity_lr,
         n_infer_iters=n_infer_iters,
         width=width,
         dir_name=dir_name,
+        **_axis_kwargs(x_col, xlabel, xscale, invert_x, ymin_floor=0.0),
     )
 
 
@@ -1663,26 +1724,36 @@ def plot_kernel_effective_rank_vs_time(
     width=None,
     dir_name="alignment",
     feature_symbol="h",
+    ylabel=None,
+    filename="kernel_effective_rank_vs_time.png",
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
 ):
-    """Per-layer participation-ratio effective rank of PC / BP kernels vs ``t``.
+    """Per-layer participation-ratio effective rank of PC / BP kernels.
 
-    ``rank_df`` must have columns ``t``, ``layer``, ``method``, and
+    ``rank_df`` must have columns ``x_col``, ``layer``, ``method``, and
     ``effective_rank``.
     """
     sym = _feature_kernel_tex(feature_symbol)
+    arg = {"t": "t", "loss": "L"}.get(x_col, x_col)
+    if ylabel is None:
+        ylabel = rf"$R_{{\mathrm{{eff}}}}(C^{{{sym},\ell}}({arg}))$"
     return plot_pc_bp_metric_vs_time(
         rank_df,
         plots_dir,
         value_col="effective_rank",
-        ylabel=rf"$R_{{\mathrm{{eff}}}}(C^{{{sym},\ell}}(t))$",
+        ylabel=ylabel,
         title="Feature-kernel effective rank (participation ratio)",
-        filename="kernel_effective_rank_vs_time.png",
+        filename=filename,
         n_hidden=n_hidden,
         gamma_0=gamma_0,
         activity_lr=activity_lr,
         n_infer_iters=n_infer_iters,
         width=width,
         dir_name=dir_name,
+        **_axis_kwargs(x_col, xlabel, xscale, invert_x),
     )
 
 
@@ -1890,10 +1961,15 @@ def plot_pc_bp_subspace_overlap_vs_time(
     width=None,
     dir_name="alignment",
     feature_symbol="h",
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
+    filename="pc_bp_subspace_overlap_vs_time.png",
 ):
-    """Per-layer PC–BP top-``k`` eigenspace overlap vs training time.
+    """Per-layer PC–BP top-``k`` eigenspace overlap vs ``x_col``.
 
-    ``overlap_df`` must have columns ``t``, ``layer``, ``k``, and
+    ``overlap_df`` must have columns ``x_col``, ``layer``, ``k``, and
     ``overlap`` (mean of ``cos^2 θ_i``). One subplot per layer; one
     curve per ``k``.
     """
@@ -1912,9 +1988,8 @@ def plot_pc_bp_subspace_overlap_vs_time(
     layers = sorted(overlap_df["layer"].unique())
     ks = sorted(overlap_df["k"].unique())
     n_l = len(layers)
-    ylim = _data_ylim(overlap_df["overlap"], invert=False)
-    n_t = overlap_df["t"].nunique()
-    markersize = 3.5 if n_t > 20 else 6
+    ylim = _data_ylim(overlap_df["overlap"], invert=False, ymin_floor=0.0)
+    markersize = _markersize_for_n(overlap_df[x_col].nunique())
     cmap = plt.get_cmap("viridis")
     k_colors = {
         k: cmap(i / max(1, len(ks) - 1)) for i, k in enumerate(ks)
@@ -1925,16 +2000,16 @@ def plot_pc_bp_subspace_overlap_vs_time(
         ax = axes[i // ncols, i % ncols]
         sub = overlap_df[overlap_df["layer"] == layer]
         for j, k in enumerate(ks):
-            ksub = sub[sub["k"] == k].sort_values("t")
+            ksub = sub[sub["k"] == k].sort_values(x_col)
             if not len(ksub):
                 continue
-            t = np.asarray(ksub["t"], dtype=float)
+            x = np.asarray(ksub[x_col], dtype=float)
             values = np.asarray(ksub["overlap"], dtype=float)
             _warn_if_nonfinite(
                 f"subspace overlap (layer={layer}, k={int(k)})", values
             )
             ax.plot(
-                t,
+                x,
                 values,
                 marker=_K_MARKERS[j % len(_K_MARKERS)],
                 markersize=markersize,
@@ -1942,9 +2017,9 @@ def plot_pc_bp_subspace_overlap_vs_time(
                 label=rf"$k={int(k)}$",
             )
         ax.set_title(rf"$\ell = {int(layer) + 1}$")
-        ax.set_xlabel("$t$")
+        _apply_x_axis(ax, xlabel=xlabel, xscale=xscale, invert_x=invert_x)
         _maybe_set_ylim(ax, ylim)
-        ax.grid(True, alpha=0.4)
+        ax.grid(True, alpha=0.4, which="both" if xscale == "log" else "major")
         if i % ncols == 0:
             ax.set_ylabel(
                 r"$\frac{1}{k}\sum_{i=1}^{k}\cos^{2}\theta_i$"
@@ -1966,12 +2041,10 @@ def plot_pc_bp_subspace_overlap_vs_time(
     )
     fig.suptitle(title, y=1.02)
     fig.tight_layout()
-    save_path = os.path.join(
-        out_dir, "pc_bp_subspace_overlap_vs_time.png"
-    )
+    save_path = os.path.join(out_dir, filename)
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
-    print(f"PC-BP subspace overlap vs time saved to {save_path}")
+    print(f"PC-BP subspace overlap plot saved to {save_path}")
     return save_path
 
 
@@ -2007,7 +2080,7 @@ def plot_temporal_pc_bp_alignment_vs_layer(
     layers = plot_df["layer"].astype(int) + 1
     values = np.asarray(plot_df["alignment"], dtype=float)
     _warn_if_nonfinite("temporal pc-bp alignment", values)
-    ylim = _data_ylim(values, invert=False)
+    ylim = _data_ylim(values, invert=False, ymin_floor=0.0)
 
     plt.figure(figsize=(5.5, 3.6))
     ax = plt.gca()
@@ -2060,12 +2133,15 @@ def plot_pc_bp_alignment_vs_time(
     filename="pc_bp_kernel_alignment_vs_time.png",
     title=None,
     ylim=None,
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
 ):
-    """PC-BP feature-kernel CKA over training time.
+    """PC-BP feature-kernel CKA over ``x_col``.
 
-    ``alignment_df`` must have columns ``t``, ``layer``, and
-    ``alignment``. One curve is drawn per hidden layer, x-axis is
-    training time ``t``.
+    ``alignment_df`` must have columns ``x_col``, ``layer``, and
+    ``alignment``. One curve is drawn per hidden layer.
 
     ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     Pass ``ylabel`` / ``filename`` / ``title`` / ``ylim`` to reuse this
@@ -2080,24 +2156,25 @@ def plot_pc_bp_alignment_vs_time(
     cmap = plt.get_cmap("viridis")
     colors = [cmap(i / max(1, len(layers) - 1)) for i in range(len(layers))]
     sym = _feature_kernel_tex(feature_symbol)
+    arg = {"t": "t", "loss": "L"}.get(x_col, x_col)
     if ylabel is None:
         ylabel = (
-            rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}_{{\mathrm{{PC}}}}(t), "
-            rf"C^{{{sym},\ell}}_{{\mathrm{{BP}}}}(t))$"
+            rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}_{{\mathrm{{PC}}}}({arg}), "
+            rf"C^{{{sym},\ell}}_{{\mathrm{{BP}}}}({arg}))$"
         )
     if title is None:
         title = "PC vs backprop feature-kernel alignment over training"
 
     plt.figure(figsize=(8, 6))
-    n_t = alignment_df["t"].nunique()
-    markersize = 3.5 if n_t > 20 else 6
+    ax = plt.gca()
+    markersize = _markersize_for_n(alignment_df[x_col].nunique())
     for layer, color in zip(layers, colors):
-        sub = alignment_df[alignment_df["layer"] == layer].sort_values("t")
-        t = np.asarray(sub["t"], dtype=float)
+        sub = alignment_df[alignment_df["layer"] == layer].sort_values(x_col)
+        x = np.asarray(sub[x_col], dtype=float)
         values = np.asarray(sub["alignment"], dtype=float)
         _warn_if_nonfinite(f"pc-bp alignment layer={int(layer)}", values)
-        plt.plot(
-            t,
+        ax.plot(
+            x,
             values,
             marker="o",
             markersize=markersize,
@@ -2105,22 +2182,19 @@ def plot_pc_bp_alignment_vs_time(
             label=rf"$\ell = {int(layer) + 1}$",
         )
 
-    plt.xlabel("$t$")
-    plt.ylabel(ylabel)
-    if n_hidden is not None:
-        title += f", $H={int(n_hidden)}$"
-    if width is not None:
-        title += f", $N={int(width)}$"
-    if gamma_0 is not None:
-        title += f", $\\gamma_0={gamma_0}$"
-    if activity_lr is not None:
-        title += f", activity lr$={activity_lr}$"
-    plt.title(title)
+    _apply_x_axis(ax, xlabel=xlabel, xscale=xscale, invert_x=invert_x)
+    ax.set_ylabel(ylabel)
+    title += _fig_param_suffix(
+        n_hidden=n_hidden, width=width, gamma_0=gamma_0, activity_lr=activity_lr
+    )
+    ax.set_title(title)
     if ylim is None:
-        ylim = _data_ylim(alignment_df["alignment"], invert=False)
-    _maybe_set_ylim(plt.gca(), ylim)
-    plt.legend(fontsize=8)
-    plt.grid(True, alpha=0.4)
+        ylim = _data_ylim(
+            alignment_df["alignment"], invert=False, ymin_floor=0.0
+        )
+    _maybe_set_ylim(ax, ylim)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.4, which="both" if xscale == "log" else "major")
     plt.tight_layout()
     out_dir = _alignment_plots_dir(
         plots_dir,
@@ -2133,7 +2207,7 @@ def plot_pc_bp_alignment_vs_time(
     save_path = os.path.join(out_dir, filename)
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
-    print(f"PC-BP kernel alignment (vs time) plot saved to {save_path}")
+    print(f"PC-BP kernel alignment plot saved to {save_path}")
     return save_path
 
 
@@ -2148,10 +2222,11 @@ def plot_kernel_concentration_per_timepoint(
     n_seeds=None,
     dir_name="alignment",
     feature_symbol="h",
+    x_col="t",
 ):
-    """Mean pairwise CKA of kernels across seeds, vs layer, one subplot per ``t``.
+    """Mean pairwise CKA of kernels across seeds, vs layer, one subplot per ``x_col``.
 
-    ``conc_df`` must have columns ``t``, ``layer``, ``method`` (``"pc"``
+    ``conc_df`` must have columns ``x_col``, ``layer``, ``method`` (``"pc"``
     or ``"bp"``), ``cka_mean``, and optionally ``cka_std``. High CKA
     means kernels concentrate across initialisations.
     """
@@ -2167,11 +2242,13 @@ def plot_kernel_concentration_per_timepoint(
         n_infer_iters=n_infer_iters,
         dir_name=dir_name,
     )
-    timepoints = sorted(conc_df["t"].unique())
-    n_t = len(timepoints)
-    ncols = int(np.ceil(np.sqrt(n_t)))
-    nrows = int(np.ceil(n_t / ncols))
-    ylim = _data_ylim(conc_df["cka_mean"], invert=False)
+    x_values = sorted(conc_df[x_col].unique())
+    if x_col == "loss":
+        x_values = list(reversed(x_values))
+    n_x = len(x_values)
+    ncols = int(np.ceil(np.sqrt(n_x)))
+    nrows = int(np.ceil(n_x / ncols))
+    ylim = _data_ylim(conc_df["cka_mean"], invert=False, ymin_floor=0.0)
     has_std = "cka_std" in conc_df.columns
     sym = _feature_kernel_tex(feature_symbol)
 
@@ -2182,9 +2259,9 @@ def plot_kernel_concentration_per_timepoint(
         squeeze=False,
         sharey=True,
     )
-    for i, t in enumerate(timepoints):
+    for i, x in enumerate(x_values):
         ax = axes[i // ncols, i % ncols]
-        sub = conc_df[conc_df["t"] == t]
+        sub = conc_df[conc_df[x_col] == x]
         for method, color, marker, label in (
             ("pc", "tab:blue", "o", "PC"),
             ("bp", "tab:orange", "s", "Backprop"),
@@ -2194,7 +2271,7 @@ def plot_kernel_concentration_per_timepoint(
                 continue
             layers = np.asarray(msub["layer"], dtype=float) + 1
             values = np.asarray(msub["cka_mean"], dtype=float)
-            _warn_if_nonfinite(f"{method} concentration (t={t})", values)
+            _warn_if_nonfinite(f"{method} concentration ({x_col}={x})", values)
             plot_kw_line = dict(marker=marker, color=color, label=label)
             if has_std:
                 ax.errorbar(
@@ -2205,7 +2282,10 @@ def plot_kernel_concentration_per_timepoint(
                 )
             else:
                 ax.plot(layers, values, **plot_kw_line)
-        ax.set_title(rf"$t={int(t)}$")
+        if x_col == "loss":
+            ax.set_title(rf"$L={float(x):.2e}$")
+        else:
+            ax.set_title(rf"$t={int(x)}$")
         ax.set_xlabel(r"layer $\ell$")
         _maybe_set_ylim(ax, ylim)
         ax.grid(True, alpha=0.4)
@@ -2216,20 +2296,15 @@ def plot_kernel_concentration_per_timepoint(
         if i == 0:
             ax.legend(fontsize=8)
 
-    for j in range(n_t, nrows * ncols):
+    for j in range(n_x, nrows * ncols):
         axes[j // ncols, j % ncols].axis("off")
 
     fig_title = "Feature-kernel concentration across seeds"
     if n_seeds is not None:
         fig_title += rf", $n_{{\mathrm{{seeds}}}}={int(n_seeds)}$"
-    if n_hidden is not None:
-        fig_title += f", $H={int(n_hidden)}$"
-    if width is not None:
-        fig_title += f", $N={int(width)}$"
-    if gamma_0 is not None:
-        fig_title += f", $\\gamma_0={gamma_0}$"
-    if activity_lr is not None:
-        fig_title += f", activity lr$={activity_lr}$"
+    fig_title += _fig_param_suffix(
+        n_hidden=n_hidden, width=width, gamma_0=gamma_0, activity_lr=activity_lr
+    )
     fig.suptitle(fig_title, y=1.02)
     fig.tight_layout()
     save_path = os.path.join(out_dir, "kernel_concentration_vs_layer_grid.png")
@@ -2250,8 +2325,13 @@ def plot_kernel_concentration_vs_time(
     n_seeds=None,
     dir_name="alignment",
     feature_symbol="h",
+    x_col="t",
+    xlabel="$t$",
+    xscale="linear",
+    invert_x=False,
+    filename="kernel_concentration_vs_time.png",
 ):
-    """Mean pairwise CKA of kernels across seeds vs training time.
+    """Mean pairwise CKA of kernels across seeds vs ``x_col``.
 
     One colour per layer; PC solid, backprop dashed.
     """
@@ -2263,10 +2343,11 @@ def plot_kernel_concentration_vs_time(
     cmap = plt.get_cmap("viridis")
     colors = [cmap(i / max(1, len(layers) - 1)) for i in range(len(layers))]
     has_std = "cka_std" in conc_df.columns
-    ylim = _data_ylim(conc_df["cka_mean"], invert=False)
+    ylim = _data_ylim(conc_df["cka_mean"], invert=False, ymin_floor=0.0)
     sym = _feature_kernel_tex(feature_symbol)
 
     plt.figure(figsize=(8, 6))
+    ax = plt.gca()
     for layer, color in zip(layers, colors):
         for method, ls, marker in (
             ("pc", "-", "o"),
@@ -2274,10 +2355,10 @@ def plot_kernel_concentration_vs_time(
         ):
             sub = conc_df[
                 (conc_df["layer"] == layer) & (conc_df["method"] == method)
-            ].sort_values("t")
+            ].sort_values(x_col)
             if not len(sub):
                 continue
-            t = np.asarray(sub["t"], dtype=float)
+            x = np.asarray(sub[x_col], dtype=float)
             values = np.asarray(sub["cka_mean"], dtype=float)
             _warn_if_nonfinite(
                 f"{method} concentration layer={int(layer)}", values
@@ -2290,32 +2371,27 @@ def plot_kernel_concentration_vs_time(
                 marker=marker, linestyle=ls, color=color, label=label
             )
             if has_std:
-                plt.errorbar(
-                    t,
+                ax.errorbar(
+                    x,
                     values,
                     yerr=np.asarray(sub["cka_std"], dtype=float),
                     **line_kw,
                 )
             else:
-                plt.plot(t, values, **line_kw)
+                ax.plot(x, values, **line_kw)
 
-    plt.xlabel("$t$")
-    plt.ylabel(rf"mean pairwise $\mathrm{{CKA}}(C^{{{sym},\ell}})$")
+    _apply_x_axis(ax, xlabel=xlabel, xscale=xscale, invert_x=invert_x)
+    ax.set_ylabel(rf"mean pairwise $\mathrm{{CKA}}(C^{{{sym},\ell}})$")
     title = "Feature-kernel concentration across seeds"
     if n_seeds is not None:
         title += rf", $n_{{\mathrm{{seeds}}}}={int(n_seeds)}$"
-    if n_hidden is not None:
-        title += f", $H={int(n_hidden)}$"
-    if width is not None:
-        title += f", $N={int(width)}$"
-    if gamma_0 is not None:
-        title += f", $\\gamma_0={gamma_0}$"
-    if activity_lr is not None:
-        title += f", activity lr$={activity_lr}$"
-    plt.title(title)
-    _maybe_set_ylim(plt.gca(), ylim)
-    plt.legend(fontsize=8)
-    plt.grid(True, alpha=0.4)
+    title += _fig_param_suffix(
+        n_hidden=n_hidden, width=width, gamma_0=gamma_0, activity_lr=activity_lr
+    )
+    ax.set_title(title)
+    _maybe_set_ylim(ax, ylim)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.4, which="both" if xscale == "log" else "major")
     plt.tight_layout()
     out_dir = _alignment_plots_dir(
         plots_dir,
@@ -2325,10 +2401,10 @@ def plot_kernel_concentration_vs_time(
         n_infer_iters=n_infer_iters,
         dir_name=dir_name,
     )
-    save_path = os.path.join(out_dir, "kernel_concentration_vs_time.png")
+    save_path = os.path.join(out_dir, filename)
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
-    print(f"Kernel concentration (vs time) plot saved to {save_path}")
+    print(f"Kernel concentration plot saved to {save_path}")
     return save_path
 
 
@@ -2390,6 +2466,134 @@ def plot_pc_bp_loss(
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
     print(f"PC-BP loss plot saved to {save_path}")
+    return save_path
+
+
+def plot_pc_bp_loss_matched_times(
+    pc_losses,
+    bp_losses,
+    pc_times,
+    bp_times,
+    loss_grid,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    heatmap_idx=None,
+    yscale="log",
+    filename="pc_bp_loss.png",
+):
+    """PC vs BP loss vs time, with first-crossing markers at each ``L*``.
+
+    Small markers show every target loss on the dense grid; larger
+    markers (and faint horizontal lines) highlight the heatmap subset.
+    ``yscale`` is ``"log"`` or ``"linear"``.
+    """
+    pc_losses = np.asarray(pc_losses, dtype=float).flatten()
+    bp_losses = np.asarray(bp_losses, dtype=float).flatten()
+    pc_times = np.asarray(pc_times, dtype=int).flatten()
+    bp_times = np.asarray(bp_times, dtype=int).flatten()
+    loss_grid = np.asarray(loss_grid, dtype=float).flatten()
+    _warn_if_nonfinite("pc_losses", pc_losses)
+    _warn_if_nonfinite("bp_losses", bp_losses)
+    if heatmap_idx is None:
+        heatmap_idx = []
+    heatmap_idx = [int(i) for i in heatmap_idx]
+
+    plt.figure(figsize=(8, 6))
+    ax = plt.gca()
+    t_pc = np.arange(len(pc_losses))
+    t_bp = np.arange(len(bp_losses))
+    ax.plot(
+        t_pc, pc_losses, color="tab:blue", label="PC", alpha=0.9, zorder=2
+    )
+    ax.plot(
+        t_bp,
+        bp_losses,
+        color="tab:orange",
+        label="Backprop",
+        alpha=0.9,
+        zorder=2,
+    )
+    ax.scatter(
+        pc_times,
+        loss_grid,
+        marker="o",
+        s=18,
+        color="tab:blue",
+        zorder=3,
+        label="PC $L^*$",
+    )
+    ax.scatter(
+        bp_times,
+        loss_grid,
+        marker="s",
+        s=18,
+        color="tab:orange",
+        zorder=3,
+        label="BP $L^*$",
+    )
+    if heatmap_idx:
+        hm_pc = pc_times[heatmap_idx]
+        hm_bp = bp_times[heatmap_idx]
+        hm_L = loss_grid[heatmap_idx]
+        ax.scatter(
+            hm_pc,
+            hm_L,
+            marker="o",
+            s=70,
+            facecolors="none",
+            edgecolors="tab:blue",
+            linewidths=1.4,
+            zorder=4,
+            label="PC heatmap $L^*$",
+        )
+        ax.scatter(
+            hm_bp,
+            hm_L,
+            marker="s",
+            s=70,
+            facecolors="none",
+            edgecolors="tab:orange",
+            linewidths=1.4,
+            zorder=4,
+            label="BP heatmap $L^*$",
+        )
+        for L_star in hm_L:
+            ax.axhline(L_star, color="0.6", lw=0.8, ls=":", zorder=1)
+
+    ax.set_xlabel("$t$")
+    ax.set_ylabel("Training loss")
+    if yscale == "log":
+        ax.set_yscale("log")
+    title = (
+        "PC vs backprop training loss (loss-matched $L^*$ times)"
+        + _fig_param_suffix(
+            n_hidden=n_hidden,
+            width=width,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+        )
+    )
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.4, which="both" if yscale == "log" else "major")
+    plt.tight_layout()
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    save_path = os.path.join(out_dir, filename)
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"PC-BP loss-matched times plot saved to {save_path}")
     return save_path
 
 
@@ -2621,7 +2825,7 @@ def plot_pc_bp_kernel_alignment(
     plt.title(title)
     _maybe_set_ylim(
         plt.gca(),
-        _data_ylim(alignment_df["alignment"], invert=False),
+        _data_ylim(alignment_df["alignment"], invert=False, ymin_floor=0.0),
     )
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.4)
