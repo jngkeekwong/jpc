@@ -88,6 +88,8 @@ def _displacement_plot_filename(cosine_name, metric):
     if metric == "cosine":
         return cosine_name
     if metric == "rel_frob":
+        if cosine_name == "kernel_displacement_vs_time.png":
+            return "kernel_displacement_rel_vs_time.png"
         return cosine_name.replace(
             "kernel_displacement", "kernel_rel_displacement", 1
         )
@@ -1267,7 +1269,7 @@ def plot_kernel_displacement_per_timepoint(
     Frobenius), selected by ``metric``.     One subplot per hidden layer, x-axis is ``t``. For three or fewer
     layers the panels are arranged in a single row; otherwise an auto
     grid is used. Saved as ``kernel_displacement_vs_time.png``
-    (cosine) or ``kernel_rel_displacement_vs_time.png``.
+    (cosine) or ``kernel_displacement_rel_vs_time.png``.
 
     ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     """
@@ -1374,6 +1376,673 @@ def plot_kernel_displacement_per_timepoint(
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
     print(f"Kernel displacement vs time saved to {save_path}")
+    return save_path
+
+
+_PC_BP_STYLES = (
+    ("pc", "tab:blue", "o", "PC"),
+    ("bp", "tab:orange", "s", "Backprop"),
+)
+
+
+def _fig_param_suffix(
+    n_hidden=None, width=None, gamma_0=None, activity_lr=None
+):
+    suffix = ""
+    if n_hidden is not None:
+        suffix += f", $H={int(n_hidden)}$"
+    if width is not None:
+        suffix += f", $N={int(width)}$"
+    if gamma_0 is not None:
+        suffix += f", $\\gamma_0={gamma_0}$"
+    if activity_lr is not None:
+        suffix += f", activity lr$={activity_lr}$"
+    return suffix
+
+
+def _per_layer_axes(n_l):
+    """One panel per layer: a single row if ``n_l <= 3``, else an auto grid."""
+    if n_l <= 3:
+        ncols, nrows = n_l, 1
+    else:
+        ncols = int(np.ceil(np.sqrt(n_l)))
+        nrows = int(np.ceil(n_l / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(4.0 * ncols, 3.2 * nrows),
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    return fig, axes, nrows, ncols
+
+
+def _plot_pc_bp_series(ax, sub, *, x_col, value_col, markersize, label_prefix=""):
+    """Overlay PC and Backprop curves on ``ax`` from a per-layer slice."""
+    for method, color, marker, label in _PC_BP_STYLES:
+        msub = sub[sub["method"] == method].sort_values(x_col)
+        if not len(msub):
+            continue
+        x = np.asarray(msub[x_col], dtype=float)
+        values = np.asarray(msub[value_col], dtype=float)
+        _warn_if_nonfinite(f"{label_prefix}{method}", values)
+        ax.plot(
+            x,
+            values,
+            marker=marker,
+            markersize=markersize,
+            color=color,
+            label=label,
+        )
+
+
+def plot_pc_bp_metric_vs_time(
+    metric_df,
+    plots_dir,
+    *,
+    value_col,
+    ylabel,
+    title,
+    filename,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    invert_ylim=False,
+):
+    """Per-layer PC vs backprop line plot vs training time ``t``.
+
+    Same layout as ``plot_kernel_displacement_per_timepoint``: one
+    subplot per hidden layer, blue circles for PC and orange squares
+    for backprop. ``metric_df`` must have columns ``t``, ``layer``,
+    ``method`` (``"pc"`` or ``"bp"``), and ``value_col``.
+    """
+    if metric_df is None or len(metric_df) == 0:
+        print(f"No records to plot for {filename}.")
+        return None
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    layers = sorted(metric_df["layer"].unique())
+    n_l = len(layers)
+    ylim = _data_ylim(metric_df[value_col], invert=invert_ylim)
+    n_t = metric_df["t"].nunique()
+    markersize = 3.5 if n_t > 20 else 6
+
+    fig, axes, nrows, ncols = _per_layer_axes(n_l)
+    for i, layer in enumerate(layers):
+        ax = axes[i // ncols, i % ncols]
+        sub = metric_df[metric_df["layer"] == layer]
+        _plot_pc_bp_series(
+            ax,
+            sub,
+            x_col="t",
+            value_col=value_col,
+            markersize=markersize,
+            label_prefix=f"{value_col} (layer={layer}) ",
+        )
+        ax.set_title(rf"$\ell = {int(layer) + 1}$")
+        ax.set_xlabel("$t$")
+        _maybe_set_ylim(ax, ylim)
+        ax.grid(True, alpha=0.4)
+        if i % ncols == 0:
+            ax.set_ylabel(ylabel)
+        if i == 0:
+            ax.legend(fontsize=8)
+
+    for j in range(n_l, nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+
+    fig.suptitle(title + _fig_param_suffix(
+        n_hidden=n_hidden, width=width, gamma_0=gamma_0, activity_lr=activity_lr
+    ), y=1.02)
+    fig.tight_layout()
+    save_path = os.path.join(out_dir, filename)
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"{title} saved to {save_path}")
+    return save_path
+
+
+def plot_kernel_target_alignment_vs_time(
+    alignment_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+):
+    """Per-layer CKA of PC / BP feature kernels with the target kernel.
+
+    ``alignment_df`` must have columns ``t``, ``layer``, ``method``,
+    and ``alignment``. The target kernel is ``C^y = Y Y^T``.
+    """
+    sym = _feature_kernel_tex(feature_symbol)
+    return plot_pc_bp_metric_vs_time(
+        alignment_df,
+        plots_dir,
+        value_col="alignment",
+        ylabel=(
+            rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}(t), C^{{y}})$"
+        ),
+        title="Feature-kernel alignment with the target",
+        filename="kernel_target_alignment_vs_time.png",
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        width=width,
+        dir_name=dir_name,
+    )
+
+
+def plot_kernel_target_change_alignment_vs_time(
+    alignment_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+):
+    """Per-layer CKA of PC / BP kernel *changes* with the target kernel.
+
+    ``alignment_df`` must have columns ``t``, ``layer``, ``method``,
+    and ``alignment``. ``t=0`` should be omitted (``ΔC=0``).
+    """
+    sym = _feature_kernel_tex(feature_symbol)
+    return plot_pc_bp_metric_vs_time(
+        alignment_df,
+        plots_dir,
+        value_col="alignment",
+        ylabel=(
+            rf"$\mathrm{{CKA}}(\Delta C^{{{sym},\ell}}(t), C^{{y}})$"
+        ),
+        title="Feature-kernel change alignment with the target",
+        filename="kernel_target_change_alignment_vs_time.png",
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        width=width,
+        dir_name=dir_name,
+    )
+
+
+def plot_kernel_input_alignment_vs_time(
+    alignment_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+):
+    """Per-layer CKA of PC / BP feature kernels with the input kernel.
+
+    ``alignment_df`` must have columns ``t``, ``layer``, ``method``,
+    and ``alignment``. The input kernel is ``C^x = X X^T``.
+    """
+    sym = _feature_kernel_tex(feature_symbol)
+    return plot_pc_bp_metric_vs_time(
+        alignment_df,
+        plots_dir,
+        value_col="alignment",
+        ylabel=(
+            rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}(t), C^{{x}})$"
+        ),
+        title="Feature-kernel alignment with the input",
+        filename="kernel_input_alignment_vs_time.png",
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        width=width,
+        dir_name=dir_name,
+    )
+
+
+def plot_leading_evec_label_overlap_vs_time(
+    overlap_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+    ylabel=None,
+):
+    """Per-layer overlap of the centered leading eigenvector with labels.
+
+    ``overlap_df`` must have columns ``t``, ``layer``, ``method``, and
+    ``overlap``. Default ylabel is ``|cos(v_1, y)|``.
+    """
+    if ylabel is None:
+        ylabel = r"$\left|\cos(v_1^{\ell}(t), y)\right|$"
+    return plot_pc_bp_metric_vs_time(
+        overlap_df,
+        plots_dir,
+        value_col="overlap",
+        ylabel=ylabel,
+        title="Leading-eigenvector overlap with the labels",
+        filename="evec_leading_overlap_label_vs_time.png",
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        width=width,
+        dir_name=dir_name,
+    )
+
+
+def plot_kernel_effective_rank_vs_time(
+    rank_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+):
+    """Per-layer participation-ratio effective rank of PC / BP kernels vs ``t``.
+
+    ``rank_df`` must have columns ``t``, ``layer``, ``method``, and
+    ``effective_rank``.
+    """
+    sym = _feature_kernel_tex(feature_symbol)
+    return plot_pc_bp_metric_vs_time(
+        rank_df,
+        plots_dir,
+        value_col="effective_rank",
+        ylabel=rf"$R_{{\mathrm{{eff}}}}(C^{{{sym},\ell}}(t))$",
+        title="Feature-kernel effective rank (participation ratio)",
+        filename="kernel_effective_rank_vs_time.png",
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        width=width,
+        dir_name=dir_name,
+    )
+
+
+def plot_kernel_spectrum(
+    spectrum_df,
+    plots_dir,
+    *,
+    title,
+    filename,
+    ylabel,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+    annotate_rank=False,
+    xlabel=r"eigenvalue index $i$",
+):
+    """Per-layer kernel eigenspectrum, PC vs backprop, log y-scale.
+
+    ``spectrum_df`` must have columns ``layer``, ``method``, ``index``
+    (1-based, descending eigenvalues), and ``eigenvalue``. If
+    ``annotate_rank`` is True, ``effective_rank`` is written on each
+    panel.
+    """
+    if spectrum_df is None or len(spectrum_df) == 0:
+        print(f"No records to plot for {filename}.")
+        return None
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    layers = sorted(spectrum_df["layer"].unique())
+    n_l = len(layers)
+    n_idx = int(spectrum_df["index"].nunique())
+    if n_idx > 80:
+        markersize = None
+    elif n_idx > 20:
+        markersize = 3.5
+    else:
+        markersize = 6
+
+    if n_l <= 3:
+        ncols, nrows = n_l, 1
+    else:
+        ncols = int(np.ceil(np.sqrt(n_l)))
+        nrows = int(np.ceil(n_l / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(4.0 * ncols, 3.2 * nrows),
+        squeeze=False,
+        sharex=True,
+        sharey=False,
+    )
+    for i, layer in enumerate(layers):
+        ax = axes[i // ncols, i % ncols]
+        sub = spectrum_df[spectrum_df["layer"] == layer]
+        rank_notes = []
+        for method, color, marker, label in _PC_BP_STYLES:
+            msub = sub[sub["method"] == method].sort_values("index")
+            if not len(msub):
+                continue
+            idx = np.asarray(msub["index"], dtype=float)
+            values = np.asarray(msub["eigenvalue"], dtype=float)
+            _warn_if_nonfinite(
+                f"{label} spectrum (layer={layer})", values
+            )
+            values = np.where(values > 0.0, values, np.nan)
+            plot_kw = dict(color=color, label=label)
+            if markersize is None:
+                plot_kw["marker"] = None
+            else:
+                plot_kw["marker"] = marker
+                plot_kw["markersize"] = markersize
+            ax.plot(idx, values, **plot_kw)
+            if annotate_rank and "effective_rank" in msub.columns:
+                r_eff = float(msub["effective_rank"].iloc[0])
+                rank_notes.append(
+                    rf"$R_{{\mathrm{{eff}}}}^{{\mathrm{{{label}}}}}="
+                    rf"{r_eff:.2f}$"
+                )
+        ax.set_yscale("log")
+        ax.set_title(rf"$\ell = {int(layer) + 1}$")
+        ax.set_xlabel(xlabel)
+        ax.grid(True, alpha=0.4, which="both")
+        if i % ncols == 0:
+            ax.set_ylabel(ylabel)
+        if i == 0:
+            ax.legend(fontsize=8)
+        if rank_notes:
+            ax.text(
+                0.97,
+                0.97,
+                "\n".join(rank_notes),
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+            )
+
+    for j in range(n_l, nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+
+    fig.suptitle(title + _fig_param_suffix(
+        n_hidden=n_hidden, width=width, gamma_0=gamma_0, activity_lr=activity_lr
+    ), y=1.02)
+    fig.tight_layout()
+    save_path = os.path.join(out_dir, filename)
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"{title} saved to {save_path}")
+    return save_path
+
+
+def plot_temporal_kernel_effective_rank_vs_layer(
+    rank_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+):
+    """Participation-ratio effective rank of sample-traced kernels vs layer.
+
+    ``rank_df`` must have columns ``layer``, ``method``, and
+    ``effective_rank``.
+    """
+    if rank_df is None or len(rank_df) == 0:
+        print("No temporal-kernel effective-rank records to plot.")
+        return None
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    sym = _feature_kernel_tex(feature_symbol)
+    ylim = _data_ylim(rank_df["effective_rank"], invert=False)
+
+    plt.figure(figsize=(5.5, 3.6))
+    ax = plt.gca()
+    plot_df = rank_df.copy()
+    plot_df["layer_display"] = plot_df["layer"].astype(int) + 1
+    _plot_pc_bp_series(
+        ax,
+        plot_df,
+        x_col="layer_display",
+        value_col="effective_rank",
+        markersize=8,
+        label_prefix="temporal rank ",
+    )
+    layers = sorted(plot_df["layer_display"].unique())
+    ax.set_xticks(layers)
+    ax.set_xlabel(r"layer $\ell$")
+    ax.set_ylabel(
+        rf"$R_{{\mathrm{{eff}}}}(C^{{{sym},\ell}}_{{\mathrm{{temp}}}})$"
+    )
+    _maybe_set_ylim(ax, ylim)
+    ax.grid(True, alpha=0.4)
+    ax.legend(fontsize=8)
+    title = (
+        "Sample-traced feature-kernel effective rank (participation ratio)"
+        + _fig_param_suffix(
+            n_hidden=n_hidden,
+            width=width,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+        )
+    )
+    ax.set_title(title)
+    plt.tight_layout()
+    save_path = os.path.join(
+        out_dir, "temporal_kernel_effective_rank_vs_layer.png"
+    )
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"Temporal-kernel effective rank saved to {save_path}")
+    return save_path
+
+
+_K_MARKERS = ("o", "D", "^", "s", "v", "P")
+
+
+def plot_pc_bp_subspace_overlap_vs_time(
+    overlap_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+):
+    """Per-layer PC–BP top-``k`` eigenspace overlap vs training time.
+
+    ``overlap_df`` must have columns ``t``, ``layer``, ``k``, and
+    ``overlap`` (mean of ``cos^2 θ_i``). One subplot per layer; one
+    curve per ``k``.
+    """
+    if overlap_df is None or len(overlap_df) == 0:
+        print("No PC-BP subspace-overlap records to plot.")
+        return None
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    layers = sorted(overlap_df["layer"].unique())
+    ks = sorted(overlap_df["k"].unique())
+    n_l = len(layers)
+    ylim = _data_ylim(overlap_df["overlap"], invert=False)
+    n_t = overlap_df["t"].nunique()
+    markersize = 3.5 if n_t > 20 else 6
+    cmap = plt.get_cmap("viridis")
+    k_colors = {
+        k: cmap(i / max(1, len(ks) - 1)) for i, k in enumerate(ks)
+    }
+
+    fig, axes, nrows, ncols = _per_layer_axes(n_l)
+    for i, layer in enumerate(layers):
+        ax = axes[i // ncols, i % ncols]
+        sub = overlap_df[overlap_df["layer"] == layer]
+        for j, k in enumerate(ks):
+            ksub = sub[sub["k"] == k].sort_values("t")
+            if not len(ksub):
+                continue
+            t = np.asarray(ksub["t"], dtype=float)
+            values = np.asarray(ksub["overlap"], dtype=float)
+            _warn_if_nonfinite(
+                f"subspace overlap (layer={layer}, k={int(k)})", values
+            )
+            ax.plot(
+                t,
+                values,
+                marker=_K_MARKERS[j % len(_K_MARKERS)],
+                markersize=markersize,
+                color=k_colors[k],
+                label=rf"$k={int(k)}$",
+            )
+        ax.set_title(rf"$\ell = {int(layer) + 1}$")
+        ax.set_xlabel("$t$")
+        _maybe_set_ylim(ax, ylim)
+        ax.grid(True, alpha=0.4)
+        if i % ncols == 0:
+            ax.set_ylabel(
+                r"$\frac{1}{k}\sum_{i=1}^{k}\cos^{2}\theta_i$"
+            )
+        if i == 0:
+            ax.legend(fontsize=8)
+
+    for j in range(n_l, nrows * ncols):
+        axes[j // ncols, j % ncols].axis("off")
+
+    title = (
+        "PC vs backprop leading-eigenspace overlap"
+        + _fig_param_suffix(
+            n_hidden=n_hidden,
+            width=width,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+        )
+    )
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    save_path = os.path.join(
+        out_dir, "pc_bp_subspace_overlap_vs_time.png"
+    )
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"PC-BP subspace overlap vs time saved to {save_path}")
+    return save_path
+
+
+def plot_temporal_pc_bp_alignment_vs_layer(
+    alignment_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+):
+    """PC–BP CKA of sample-traced temporal kernels vs layer.
+
+    ``alignment_df`` must have columns ``layer`` and ``alignment``.
+    """
+    if alignment_df is None or len(alignment_df) == 0:
+        print("No temporal PC-BP alignment records to plot.")
+        return None
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    sym = _feature_kernel_tex(feature_symbol)
+    plot_df = alignment_df.copy().sort_values("layer")
+    layers = plot_df["layer"].astype(int) + 1
+    values = np.asarray(plot_df["alignment"], dtype=float)
+    _warn_if_nonfinite("temporal pc-bp alignment", values)
+    ylim = _data_ylim(values, invert=False)
+
+    plt.figure(figsize=(5.5, 3.6))
+    ax = plt.gca()
+    ax.plot(
+        layers,
+        values,
+        marker="o",
+        markersize=8,
+        color="tab:blue",
+    )
+    ax.set_xticks(list(layers))
+    ax.set_xlabel(r"layer $\ell$")
+    ax.set_ylabel(
+        rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}_{{\mathrm{{temp,PC}}}}, "
+        rf"C^{{{sym},\ell}}_{{\mathrm{{temp,BP}}}})$"
+    )
+    _maybe_set_ylim(ax, ylim)
+    ax.grid(True, alpha=0.4)
+    title = (
+        "PC vs backprop sample-traced kernel alignment"
+        + _fig_param_suffix(
+            n_hidden=n_hidden,
+            width=width,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+        )
+    )
+    ax.set_title(title)
+    plt.tight_layout()
+    save_path = os.path.join(
+        out_dir, "temporal_pc_bp_kernel_alignment_vs_layer.png"
+    )
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"Temporal PC-BP kernel alignment saved to {save_path}")
     return save_path
 
 

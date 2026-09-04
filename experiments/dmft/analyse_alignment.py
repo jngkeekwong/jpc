@@ -27,18 +27,44 @@ and alignment line plots use a denser time grid: every training step if
   curves (``alignment/kernel_displacement_vs_time.png``), plus a matching
   figure of relative Frobenius displacement
   ``||C_t - C_0||_F / ||C_0||_F``
-  (``alignment/kernel_rel_displacement_vs_time.png``).
+  (``alignment/kernel_displacement_rel_vs_time.png``).
+- Kernel-target alignment vs time: same per-layer layout, linear CKA of
+  each PC / BP feature kernel with the target kernel ``C^y = Y Y^T``
+  (``alignment/kernel_target_alignment_vs_time.png``), plus CKA of the
+  kernel *change* ``C(t) - C(0)`` with ``C^y``, omitting ``t=0``
+  (``alignment/kernel_target_change_alignment_vs_time.png``).
+- Kernel-input alignment vs time: CKA with the input kernel
+  ``C^x = X X^T`` (``alignment/kernel_input_alignment_vs_time.png``).
+- Leading-eigenvector overlap with the labels: absolute cosine of the
+  leading eigenvector of the *centered* feature kernel with ``y``
+  (subspace cosine if ``Y`` has several columns)
+  (``alignment/evec_leading_overlap_label_vs_time.png``).
+- Feature-kernel effective rank vs time: participation ratio
+  ``(sum λ)^2 / sum λ^2`` of the uncentered ``P x P`` kernels, PC and BP
+  (``alignment/kernel_effective_rank_vs_time.png``).
 - PC-BP alignment vs. time: a single figure, centered kernel alignment
   (CKA) between the PC and backprop feature kernels at each layer,
   x-axis is training time ``t``, one curve per layer
   (``alignment/pc_bp_kernel_alignment_vs_time.png``), plus a matching
   figure of CKA between the kernel *changes* ``C(t) - C(0)``, omitting
-  ``t=0`` (``alignment/pc_bp_kernel_change_alignment_vs_time.png``).
+  ``t=0`` (``alignment/pc_bp_kernel_change_alignment_vs_time.png``), plus
+  top-``k`` eigenspace overlap (mean of ``cos^2 θ_i`` for ``k=1,3,5``),
+  one subplot per layer (``alignment/pc_bp_subspace_overlap_vs_time.png``).
+- Final-kernel spectrum: uncentered eigenvalues of the last-step
+  ``P x P`` kernels, one subplot per layer, log y-scale, PC vs BP
+  (``alignment/kernel_spectrum_final.png``).
 - Sample-traced temporal kernels: a single figure using the same grid
   scheme as the feature-kernel grid (top row PC / bottom row backprop,
   one column per layer), but with ``T x T`` kernels traced over samples
   and spanning the whole training trajectory at once, displayed as
   correlations (``alignment/temporal_kernels_grid.png``).
+- Temporal-kernel spectrum and effective rank: log-y eigenspectrum of
+  the ``T x T`` sample-traced kernels with ``R_eff`` annotated on each
+  panel (``alignment/temporal_kernel_spectrum.png``), plus
+  participation ratio vs layer
+  (``alignment/temporal_kernel_effective_rank_vs_layer.png``), plus
+  PC–BP CKA of those temporal kernels vs layer
+  (``alignment/temporal_pc_bp_kernel_alignment_vs_layer.png``).
 - If ``--n_seeds > 1``: kernel concentration across weight-init seeds
   (mean pairwise CKA of PC kernels and of BP kernels), vs layer and vs
   time (``alignment/kernel_concentration_vs_layer_grid.png``,
@@ -76,8 +102,13 @@ from experiments.dmft.utils import (
     cosine_similarity,
     create_tiny_cifar10_dataset,
     create_toy_dataset,
+    kernel_eigs,
     kernels_to_correlations,
+    leading_evec_label_overlap,
+    participation_ratio,
+    participation_ratio_from_eigs,
     relative_frobenius_displacement,
+    subspace_overlap,
     train_bpn,
 )
 from theory_pc_nonlin_utils import get_nonlinearity
@@ -93,8 +124,17 @@ from plot_dmft_results import (
     plot_kernel_displacement_per_timepoint,
     plot_kernel_concentration_per_timepoint,
     plot_kernel_concentration_vs_time,
+    plot_kernel_effective_rank_vs_time,
+    plot_kernel_input_alignment_vs_time,
+    plot_kernel_spectrum,
+    plot_kernel_target_alignment_vs_time,
+    plot_kernel_target_change_alignment_vs_time,
+    plot_leading_evec_label_overlap_vs_time,
     plot_pc_bp_alignment_vs_time,
     plot_pc_bp_loss,
+    plot_pc_bp_subspace_overlap_vs_time,
+    plot_temporal_kernel_effective_rank_vs_layer,
+    plot_temporal_pc_bp_alignment_vs_layer,
 )
 
 
@@ -128,6 +168,42 @@ def _select_curve_timepoints(n_train_iters, stride=2, every_t_max=31):
 
 
 _INIT_CKA_ATOL = 1e-3
+_SUBSPACE_KS = (1, 3, 5)
+
+
+def _sample_gram(M):
+    """Gram over samples: rows of ``M`` are samples, ``C = M M^T``."""
+    M = np.asarray(M, dtype=np.float64)
+    if M.ndim == 1:
+        M = M[:, None]
+    return M @ M.T
+
+
+def _target_kernel(Y_target):
+    """Label Gram ``C^y = Y Y^T`` with sample axis first."""
+    return _sample_gram(Y_target)
+
+
+def _input_kernel(X_input):
+    """Input Gram ``C^x = X X^T`` with sample axis first."""
+    return _sample_gram(X_input)
+
+
+def _spectrum_records(kernels, method):
+    """One row per descending eigenvalue of each layer's kernel."""
+    records = []
+    for l, C in enumerate(kernels):
+        eigs = kernel_eigs(C)
+        r_eff = participation_ratio_from_eigs(eigs)
+        for i, lam in enumerate(eigs):
+            records.append({
+                "layer": l,
+                "method": method,
+                "index": i + 1,
+                "eigenvalue": float(lam),
+                "effective_rank": r_eff,
+            })
+    return records
 
 
 def _assert_init_pc_bp_cka(pc_kernels, bp_kernels, *, seed, atol=_INIT_CKA_ATOL):
@@ -392,6 +468,15 @@ if __name__ == "__main__":
     X_input = jnp.asarray(X.T, dtype=jnp.float32)
     Y_target = y[:, None] if y.ndim == 1 else y
     Y_target = jnp.asarray(Y_target, dtype=jnp.float32)
+    C_y = _target_kernel(Y_target)
+    C_x = _input_kernel(X_input)
+    n_label_cols = 1 if np.asarray(Y_target).ndim == 1 else int(
+        np.asarray(Y_target).shape[1]
+    )
+    print(
+        f"Target kernel C^y shape: {C_y.shape}, "
+        f"input kernel C^x shape: {C_x.shape}"
+    )
     loss_id = (
         "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
     )
@@ -562,6 +647,12 @@ if __name__ == "__main__":
         displacement_records = []
         alignment_records = []
         change_alignment_records = []
+        target_alignment_records = []
+        rank_records = []
+        change_target_alignment_records = []
+        input_alignment_records = []
+        evec_overlap_records = []
+        subspace_overlap_records = []
         for t in curve_timepoints:
             for l in range(n_hidden):
                 pc_C0 = pc_kernels_by_t[t0][l]
@@ -613,6 +704,66 @@ if __name__ == "__main__":
                             )
                         ),
                     })
+                for method, Ct in (("pc", pc_Ct), ("bp", bp_Ct)):
+                    target_alignment_records.append({
+                        "t": t,
+                        "layer": l,
+                        "method": method,
+                        "alignment": float(
+                            centered_kernel_alignment(Ct, C_y, eps=1e-30)
+                        ),
+                    })
+                    rank_records.append({
+                        "t": t,
+                        "layer": l,
+                        "method": method,
+                        "effective_rank": float(participation_ratio(Ct)),
+                    })
+                    input_alignment_records.append({
+                        "t": t,
+                        "layer": l,
+                        "method": method,
+                        "alignment": float(
+                            centered_kernel_alignment(Ct, C_x, eps=1e-30)
+                        ),
+                    })
+                    evec_overlap_records.append({
+                        "t": t,
+                        "layer": l,
+                        "method": method,
+                        "overlap": float(
+                            leading_evec_label_overlap(Ct, Y_target)
+                        ),
+                    })
+                if t != t0:
+                    for method, Ct, C0 in (
+                        ("pc", pc_Ct, pc_C0),
+                        ("bp", bp_Ct, bp_C0),
+                    ):
+                        change_target_alignment_records.append({
+                            "t": t,
+                            "layer": l,
+                            "method": method,
+                            "alignment": float(
+                                centered_kernel_alignment(
+                                    np.asarray(Ct) - np.asarray(C0),
+                                    C_y,
+                                    eps=1e-30,
+                                )
+                            ),
+                        })
+                max_k = max(1, int(C_y.shape[0]) - 1)
+                for k in _SUBSPACE_KS:
+                    if k > max_k:
+                        continue
+                    subspace_overlap_records.append({
+                        "t": t,
+                        "layer": l,
+                        "k": k,
+                        "overlap": float(
+                            subspace_overlap(pc_Ct, bp_Ct, k, centered=True)
+                        ),
+                    })
 
         plot_kernel_displacement_per_timepoint(
             pd.DataFrame(displacement_records),
@@ -638,6 +789,53 @@ if __name__ == "__main__":
             title=(
                 "PC vs backprop feature-kernel change alignment over training"
             ),
+            **plot_kw,
+        )
+        plot_kernel_target_alignment_vs_time(
+            pd.DataFrame(target_alignment_records),
+            **plot_kw,
+        )
+        plot_kernel_target_change_alignment_vs_time(
+            pd.DataFrame(change_target_alignment_records),
+            **plot_kw,
+        )
+        plot_kernel_input_alignment_vs_time(
+            pd.DataFrame(input_alignment_records),
+            **plot_kw,
+        )
+        evec_ylabel = (
+            r"$\left|\cos(v_1^{\ell}(t), y)\right|$"
+            if n_label_cols == 1
+            else r"$\|U_y^{\top} v_1^{\ell}(t)\|$"
+        )
+        plot_leading_evec_label_overlap_vs_time(
+            pd.DataFrame(evec_overlap_records),
+            ylabel=evec_ylabel,
+            **plot_kw,
+        )
+        plot_kernel_effective_rank_vs_time(
+            pd.DataFrame(rank_records),
+            **plot_kw,
+        )
+        plot_pc_bp_subspace_overlap_vs_time(
+            pd.DataFrame(subspace_overlap_records),
+            **plot_kw,
+        )
+
+        t_final = kernel_times[-1]
+        final_spectrum_df = pd.DataFrame(
+            _spectrum_records(pc_kernels_by_t[t_final], "pc")
+            + _spectrum_records(bp_kernels_by_t[t_final], "bp")
+        )
+        plot_kernel_spectrum(
+            final_spectrum_df,
+            ylabel=rf"$\lambda_i(C^{{{feat_tex},\ell}})$",
+            title=(
+                rf"Final $C^{{{feat_tex}}}$ feature-kernel spectrum "
+                rf"($t={t_final}$)"
+            ),
+            filename="kernel_spectrum_final.png",
+            annotate_rank=True,
             **plot_kw,
         )
 
@@ -667,6 +865,50 @@ if __name__ == "__main__":
                 rf"(correlation)"
             ),
         )
+
+        temporal_spectrum_df = pd.DataFrame(
+            _spectrum_records(pc_temporal_kernels, "pc")
+            + _spectrum_records(bp_temporal_kernels, "bp")
+        )
+        plot_kernel_spectrum(
+            temporal_spectrum_df,
+            ylabel=rf"$\lambda_i(C^{{{feat_tex},\ell}}_{{\mathrm{{temp}}}})$",
+            title=rf"Sample-traced $C^{{{feat_tex}}}$ feature-kernel spectrum",
+            filename="temporal_kernel_spectrum.png",
+            annotate_rank=True,
+            **plot_kw,
+        )
+        temporal_rank_records = (
+            temporal_spectrum_df.groupby(["layer", "method"], as_index=False)
+            .agg(effective_rank=("effective_rank", "first"))
+        )
+        plot_temporal_kernel_effective_rank_vs_layer(
+            temporal_rank_records,
+            **plot_kw,
+        )
+        temporal_cka_records = []
+        for l, (C_pc, C_bp) in enumerate(
+            zip(pc_temporal_kernels, bp_temporal_kernels)
+        ):
+            cka = float(centered_kernel_alignment(C_pc, C_bp, eps=1e-30))
+            temporal_cka_records.append({
+                "layer": l,
+                "alignment": cka,
+            })
+            print(
+                f"  temporal PC-BP CKA (layer={l + 1}): {cka:.4f}"
+            )
+        plot_temporal_pc_bp_alignment_vs_layer(
+            pd.DataFrame(temporal_cka_records),
+            **plot_kw,
+        )
+        for _, row in temporal_rank_records.sort_values(
+            ["layer", "method"]
+        ).iterrows():
+            print(
+                f"  temporal R_eff (layer={int(row['layer']) + 1}, "
+                f"{row['method']}): {float(row['effective_rank']):.4f}"
+            )
 
     if n_seeds > 1:
         print(

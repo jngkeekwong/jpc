@@ -161,6 +161,104 @@ def centered_kernel_alignment(K, L, eps=1e-30):
     return float(np.sum(Kc * Lc) / denom)
 
 
+def kernel_eigh(C, centered=False):
+    """Descending eigenvalues and eigenvectors (columns) of a kernel.
+
+    Symmetrizes ``(C + C.T) / 2``. If ``centered`` is True, uses the
+    double-centered Gram ``H C H``.
+    """
+    C = np.asarray(C, dtype=np.float64)
+    if C.ndim != 2 or C.shape[0] != C.shape[1]:
+        raise ValueError(f"expected a square kernel, got shape {C.shape}")
+    if centered:
+        C = _center_gram(C)
+    C = 0.5 * (C + C.T)
+    evals, evecs = np.linalg.eigh(C)
+    return evals[::-1].copy(), evecs[:, ::-1].copy()
+
+
+def kernel_eigs(C):
+    """Descending eigenvalues of a symmetric kernel.
+
+    Symmetrizes ``(C + C.T) / 2`` and clips numerically negative
+    eigenvalues to 0 (Gram matrices are PSD).
+    """
+    evals, _ = kernel_eigh(C, centered=False)
+    return np.maximum(evals, 0.0)
+
+
+def top_k_eigenvectors(C, k, centered=False):
+    """Orthonormal leading-``k`` eigenvectors (columns) of a kernel."""
+    _, evecs = kernel_eigh(C, centered=centered)
+    k = int(k)
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    k = min(k, evecs.shape[1])
+    return evecs[:, :k]
+
+
+def subspace_overlap(C_a, C_b, k, centered=True):
+    """Mean squared principal cosine between leading-``k`` eigenspaces.
+
+    ``||U_a^T U_b||_F^2 / k``, i.e. the average of ``cos^2 θ_i``. Equals
+    1 iff the two ``k``-planes coincide. Uses centered kernels by
+    default (the same centering as CKA).
+    """
+    Ua = top_k_eigenvectors(C_a, k, centered=centered)
+    Ub = top_k_eigenvectors(C_b, k, centered=centered)
+    k_eff = min(Ua.shape[1], Ub.shape[1])
+    if k_eff < 1:
+        return float("nan")
+    M = Ua[:, :k_eff].T @ Ub[:, :k_eff]
+    return float(np.sum(M * M) / k_eff)
+
+
+def _as_sample_matrix(Y):
+    """Ensure ``(P, d)`` with samples on axis 0."""
+    Y = np.asarray(Y, dtype=np.float64)
+    if Y.ndim == 1:
+        Y = Y[:, None]
+    return Y
+
+
+def leading_evec_label_overlap(C, Y, eps=1e-30):
+    """Overlap of the centered kernel's leading eigenvector with labels.
+
+    For a single label column this is ``|cos(v_1, y)|`` after centering
+    ``y``. For several columns it is the cosine of ``v_1`` with the
+    column space of centered ``Y`` (``||U_y^T v_1||``).
+    """
+    v = top_k_eigenvectors(C, 1, centered=True)[:, 0]
+    v_norm = np.linalg.norm(v)
+    if v_norm < eps:
+        return 0.0
+    v = v / v_norm
+    Yc = _as_sample_matrix(Y)
+    Yc = Yc - Yc.mean(axis=0, keepdims=True)
+    Uy, svals, _ = np.linalg.svd(Yc, full_matrices=False)
+    if svals.size == 0 or svals[0] < eps:
+        return 0.0
+    rank = int(np.sum(svals > eps * svals[0]))
+    return float(np.linalg.norm(Uy[:, :rank].T @ v))
+
+
+def participation_ratio_from_eigs(eigs, eps=1e-30):
+    """Participation ratio ``(sum λ)^2 / sum λ^2`` from kernel eigenvalues."""
+    eigs = np.asarray(eigs, dtype=np.float64).reshape(-1)
+    eigs = eigs[np.isfinite(eigs)]
+    eigs = np.maximum(eigs, 0.0)
+    s1 = float(eigs.sum())
+    s2 = float(np.square(eigs).sum())
+    if s2 < eps:
+        return 0.0
+    return (s1 * s1) / s2
+
+
+def participation_ratio(C, eps=1e-30):
+    """Effective rank of a kernel via the participation ratio of its eigs."""
+    return participation_ratio_from_eigs(kernel_eigs(C), eps=eps)
+
+
 def gram_to_correlation(C, eps=1e-30):
     """Convert a Gram / kernel matrix to a correlation matrix.
 
