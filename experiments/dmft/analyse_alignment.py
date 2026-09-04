@@ -12,31 +12,46 @@ step); ``closed_form`` solves the linear equilibrium activities directly
 
 For ``--n_timepoints`` equally spaced training steps ``t`` (including
 ``t=0``, the untrained feedforward network, and ``t=T-1``, the last
-training step), this produces:
+training step), this produces feature-kernel heatmap grids. Displacement
+and alignment line plots use a denser time grid: every training step if
+``T <= 31``, otherwise every 2 steps (always including the endpoints).
 
 - PC vs BP training-loss curves
   (``alignment/pc_bp_loss.png``).
-- Feature-kernel grid: one figure per timepoint, a ``P x P`` heatmap per
-  hidden layer, top row PC / bottom row backprop
+- Feature-kernel grid: one figure per heatmap timepoint, a ``P x P``
+  heatmap per hidden layer, top row PC / bottom row backprop, kernels
+  converted to correlations ``R_{ij} = C_{ij} / sqrt(C_{ii} C_{jj})``
   (``alignment/feature_kernels_grid_t{t}.png``).
-- Kernel displacement: one figure with a subplot per timepoint (auto
-  grid), cosine similarity of each layer's feature kernel at ``t`` vs.
-  at ``t=0``, PC and BP curves, x-axis is layer
-  (``alignment/kernel_displacement_vs_layer_grid.png``).
-- PC-BP alignment vs. time: a single figure, cosine similarity between
-  the PC and backprop feature kernels at each layer, x-axis is training
-  time ``t``, one curve per layer
-  (``alignment/pc_bp_kernel_alignment_vs_time.png``).
+- Kernel displacement vs time: one subplot per layer, cosine similarity
+  of each layer's feature kernel at ``t`` vs. at ``t=0``, PC and BP
+  curves (``alignment/kernel_displacement_vs_time.png``), plus a matching
+  figure of relative Frobenius displacement
+  ``||C_t - C_0||_F / ||C_0||_F``
+  (``alignment/kernel_rel_displacement_vs_time.png``).
+- PC-BP alignment vs. time: a single figure, centered kernel alignment
+  (CKA) between the PC and backprop feature kernels at each layer,
+  x-axis is training time ``t``, one curve per layer
+  (``alignment/pc_bp_kernel_alignment_vs_time.png``), plus a matching
+  figure of *centered cosine similarity* between the kernel *changes*
+  ``C(t) - C(0)`` (not CKA: difference kernels need not be PSD),
+  omitting ``t=0`` (``alignment/pc_bp_kernel_change_cosine_vs_time.png``).
 - Sample-traced temporal kernels: a single figure using the same grid
   scheme as the feature-kernel grid (top row PC / bottom row backprop,
   one column per layer), but with ``T x T`` kernels traced over samples
-  and spanning the whole training trajectory at once
-  (``alignment/temporal_kernels_grid.png``).
+  and spanning the whole training trajectory at once, displayed as
+  correlations (``alignment/temporal_kernels_grid.png``).
+- If ``--n_seeds > 1``: kernel concentration across weight-init seeds
+  (mean pairwise CKA of PC kernels and of BP kernels), vs layer and vs
+  time (``alignment/kernel_concentration_vs_layer_grid.png``,
+  ``alignment/kernel_concentration_vs_time.png``). Skipped when
+  ``--n_seeds`` is 1 (the default).
 
-``--seed`` draws two independent RNG streams (dataset, weight init); PC
-and BP get independent weight-init keys folded from the same parent so
-neither reuses the other's randomness. PC and BP always train on the
-same ``(X, y)``.
+``--seed`` draws two independent RNG streams (dataset, weight init). PC
+is initialized from the weight-init stream; BP copies those Linear
+weights so both networks start from the same parameters. At ``t=0`` the
+script asserts that PC–BP kernel CKA is close to 1 (the mismatch
+``1 - CKA`` is small). PC and BP always train on the same ``(X, y)``.
+Additional seeds (``--n_seeds``) vary only the weight-init stream.
 
 Use the ``PC_dmft_env`` conda environment:
     /data/ndcn-computational-neuroscience/mert5001/envs/PC_dmft_env/bin/python analyse_alignment.py
@@ -56,10 +71,14 @@ from experiments.limits_paper.utils import setup_bp_experiment
 from experiments.dmft.utils import (
     CIFAR_GRAY_DIM,
     MLP,
+    centered_kernel_alignment,
+    cleanup_experiment_dirs,
+    copy_mlp_linear_params,
+    cosine_similarity,
     create_tiny_cifar10_dataset,
     create_toy_dataset,
-    cleanup_experiment_dirs,
-    cosine_similarity,
+    kernels_to_correlations,
+    relative_frobenius_displacement,
     train_bpn,
 )
 from theory_pc_nonlin_utils import get_nonlinearity
@@ -73,6 +92,8 @@ from plot_dmft_results import (
     plot_final_kernel_grid,
     plot_temporal_kernel_grid,
     plot_kernel_displacement_per_timepoint,
+    plot_kernel_concentration_per_timepoint,
+    plot_kernel_concentration_vs_time,
     plot_pc_bp_alignment_vs_time,
     plot_pc_bp_loss,
 )
@@ -83,12 +104,72 @@ def _select_timepoints(n_train_iters, n_timepoints):
 
     Always includes both endpoints (``t=0`` and ``t=n_train_iters - 1``).
     If ``n_timepoints >= n_train_iters``, every training step is used.
+    Used for feature-kernel heatmap grids.
     """
     n_timepoints = max(2, min(n_timepoints, n_train_iters))
     idx = np.round(
         np.linspace(0, n_train_iters - 1, n_timepoints)
     ).astype(int)
     return np.unique(idx).tolist()
+
+
+def _select_curve_timepoints(n_train_iters, stride=2, every_t_max=31):
+    """Dense time grid for displacement and alignment line plots.
+
+    Every training step if ``T <= every_t_max``, otherwise every
+    ``stride`` steps (always including ``t=0`` and ``t=T-1``).
+    """
+    if n_train_iters <= every_t_max:
+        return list(range(n_train_iters))
+    idx = list(range(0, n_train_iters, stride))
+    last = n_train_iters - 1
+    if idx[-1] != last:
+        idx.append(last)
+    return idx
+
+
+_INIT_CKA_ATOL = 1e-3
+
+
+def _assert_init_pc_bp_cka(pc_kernels, bp_kernels, *, seed, atol=_INIT_CKA_ATOL):
+    """Assert that PC and BP feature kernels match at initialisation.
+
+    After copying PC weights onto BP, ``1 - CKA`` should be small at
+    ``t=0`` for every hidden layer.
+    """
+    if len(pc_kernels) != len(bp_kernels):
+        raise AssertionError(
+            "PC/BP init kernel counts differ: "
+            f"{len(pc_kernels)} vs {len(bp_kernels)}"
+        )
+    for l, (C_pc, C_bp) in enumerate(zip(pc_kernels, bp_kernels)):
+        cka = float(centered_kernel_alignment(C_pc, C_bp, eps=1e-30))
+        gap = abs(1.0 - cka)
+        print(
+            f"  init CKA (seed={seed}, layer={l + 1}): {cka:.6f} "
+            f"(1-CKA={gap:.2e})"
+        )
+        if gap > atol:
+            raise AssertionError(
+                f"PC vs BP init kernels differ at layer {l + 1} "
+                f"(seed={seed}): CKA={cka:.6f}, expected "
+                f"1-CKA <= {atol}"
+            )
+
+
+def _mean_pairwise_cka(kernels):
+    """Mean and std of pairwise CKA over a list of kernels (one per seed)."""
+    vals = []
+    for i in range(len(kernels)):
+        for j in range(i + 1, len(kernels)):
+            vals.append(
+                centered_kernel_alignment(kernels[i], kernels[j], eps=1e-30)
+            )
+    vals = np.asarray(vals, dtype=float)
+    if vals.size == 0:
+        return float("nan"), float("nan")
+    std = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
+    return float(vals.mean()), std
 
 
 def _train_finite_bp(
@@ -112,6 +193,7 @@ def _train_finite_bp(
     X_input,
     Y_target,
     collect_h_k0=True,
+    init_from=None,
 ):
     """Run one finite-width BP training job.
 
@@ -120,6 +202,10 @@ def _train_finite_bp(
     ``bp_hidden_preactivations`` in ``experiments.dmft.utils``) at every
     training step, before that step's parameter update — or ``None`` if
     ``collect_h_k0`` is False.
+
+    If ``init_from`` is given (a ``jpc.make_mlp`` layer list or BP
+    ``MLP``), Linear weights are copied onto the BP network after
+    construction so PC and BP share the same initial parameters.
     """
     save_dir = setup_bp_experiment(
         results_dir=results_dir,
@@ -149,6 +235,9 @@ def _train_finite_bp(
         use_bias=False,
         use_skips=use_skips,
     )
+    if init_from is not None:
+        model = copy_mlp_linear_params(init_from, model)
+        print("Copied PC initial Linear weights onto the BP network.")
     h_k0_steps = [] if collect_h_k0 else None
     train_bpn(
         model=model,
@@ -227,12 +316,23 @@ if __name__ == "__main__":
         help=(
             "Number of equally spaced training-step timepoints "
             "(including t=0 and t=T-1) used for the feature-kernel "
-            "grid, displacement, and alignment-vs-time plots."
+            "heatmap grids. Displacement and alignment line plots use a "
+            "denser grid (every step if T<=31, else every 2 steps)."
         ),
     )
 
     # Loop parameters
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--n_seeds",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent weight-init seeds (dataset is shared). "
+            "If greater than 1, plot kernel concentration across seeds "
+            "for both PC and BP. Default 1 skips that analysis."
+        ),
+    )
 
     parser.add_argument(
         "--cleanup_npy",
@@ -249,15 +349,16 @@ if __name__ == "__main__":
         parser.error(
             "--pc_infer_mode closed_form requires --act_fn linear."
         )
+    if args.n_seeds < 1:
+        parser.error("--n_seeds must be >= 1.")
 
     os.makedirs(args.results_dir, exist_ok=True)
 
-    # Two independent children of --seed: dataset and weight init. PC and
-    # BP weight-init keys are folded from the same parent so neither
-    # reuses the other's (or the data's) randomness.
+    # Two independent children of --seed: dataset and weight init. BP
+    # copies the PC Linear weights after construction, so both networks
+    # start from the same parameters (the BP constructor key is unused
+    # for the copied weights).
     data_key, model_parent = jax.random.split(jax.random.PRNGKey(args.seed))
-    model_key = jax.random.fold_in(model_parent, int(args.seed))
-    pc_key, bp_key = jax.random.split(model_key)
 
     if args.dataset == "toy":
         X, y = create_toy_dataset(
@@ -296,91 +397,23 @@ if __name__ == "__main__":
         "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
     )
 
-    set_seed(args.seed)
-
     n_hidden = args.n_hidden
     T_train = args.n_train_iters
     width = args.width
     infer_mode = "optim" if args.pc_infer_mode == "infer" else "closed_form"
-
-    # --- Finite-size PC simulation ---
-    print(
-        f"\nRunning finite-size PC ({args.pc_infer_mode}) simulation "
-        f"(N={width}, H={n_hidden})...\n"
-    )
-    pc_losses, pc_fields = _train_finite_pc(
-        pc_key,
-        results_dir=args.results_dir,
-        input_dim=input_dim,
-        output_dim=output_dim,
-        n_samples=args.n_samples,
-        n_hidden=n_hidden,
-        use_skips=args.use_skips,
-        act_fn=args.act_fn,
-        param_type=args.param_type,
-        param_lr=args.param_lr_pc,
-        gamma_0=args.gamma_0,
-        param_optim_id=args.param_optim,
-        n_train_iters=T_train,
-        infer_mode=infer_mode,
-        n_infer_iters=args.n_infer_iters,
-        activity_lr=args.activity_lr,
-        width=width,
-        loss_id=loss_id,
-        seed=args.seed,
-        X_input=X_input,
-        Y_target=Y_target,
-        collect_fields=False,
-        collect_h_k0=True,
-    )
-    pc_h_traj = pc_fields["h_k0_traj"]  # (n_hidden, T, P, N)
-    print(f"PC final training loss: {float(np.asarray(pc_losses).flatten()[-1]):.4e}")
-
-    # --- Finite-size BP simulation ---
-    print(
-        f"\nRunning finite-size BP simulation (N={width}, H={n_hidden})...\n"
-    )
-    bp_losses, bp_h_traj = _train_finite_bp(
-        bp_key,
-        results_dir=args.results_dir,
-        input_dim=input_dim,
-        output_dim=output_dim,
-        n_samples=args.n_samples,
-        n_hidden=n_hidden,
-        use_skips=args.use_skips,
-        act_fn=args.act_fn,
-        param_type=args.param_type,
-        param_lr=args.param_lr,
-        gamma_0=args.gamma_0,
-        param_optim_id=args.param_optim,
-        n_train_iters=T_train,
-        width=width,
-        loss_id=loss_id,
-        seed=args.seed,
-        X_input=X_input,
-        Y_target=Y_target,
-        collect_h_k0=True,
-    )
-    print(f"BP final training loss: {float(np.asarray(bp_losses).flatten()[-1]):.4e}")
-
+    n_seeds = args.n_seeds
     phi_fn, _ = get_nonlinearity(args.act_fn, beta=args.nonlin_beta)
     feat_sym = feature_kernel_symbol(args.act_fn)
     feat_tex = r"\phi" if feat_sym == "phi" else "h"
-
-    timepoints = _select_timepoints(T_train, args.n_timepoints)
-    print(f"\nUsing timepoints t = {timepoints} (of T = {T_train})")
-    print(f"Feature kernel: C^{feat_sym}\n")
-
-    # Feature kernels (P x P), per layer, at every selected timepoint.
-    # Linear: C^h (phi = id). Nonlinear: C^phi = phi(h) phi(h)^T / N.
-    pc_kernels_by_t = {
-        t: _feature_kernels_from_h(pc_h_traj[:, t], phi_fn)
-        for t in timepoints
-    }
-    bp_kernels_by_t = {
-        t: _feature_kernels_from_h(bp_h_traj[:, t], phi_fn)
-        for t in timepoints
-    }
+    heatmap_timepoints = _select_timepoints(T_train, args.n_timepoints)
+    curve_timepoints = _select_curve_timepoints(T_train)
+    kernel_times = sorted(set(heatmap_timepoints) | set(curve_timepoints))
+    print(
+        f"\nHeatmap timepoints t = {heatmap_timepoints} (of T = {T_train})"
+    )
+    print(f"Curve timepoints t = {curve_timepoints}")
+    print(f"Feature kernel: C^{feat_sym}")
+    print(f"n_seeds = {n_seeds}\n")
 
     plots_dir = os.path.join(
         args.results_dir,
@@ -398,23 +431,229 @@ if __name__ == "__main__":
         feature_symbol=feat_sym,
     )
 
-    plot_pc_bp_loss(
-        pc_losses,
-        bp_losses,
-        plots_dir=plots_dir,
-        n_hidden=n_hidden,
-        gamma_0=args.gamma_0,
-        activity_lr=args.activity_lr,
-        n_infer_iters=args.n_infer_iters,
-        width=width,
-    )
+    pc_kernels_by_seed = []
+    bp_kernels_by_seed = []
+    plot_seed = args.seed
 
-    # --- Feature-kernel grid: one figure per timepoint, top=PC, bottom=BP ---
-    for t in timepoints:
-        plot_final_kernel_grid(
+    for seed in range(args.seed, args.seed + n_seeds):
+        print(f"\n=== seed {seed} ===")
+        set_seed(seed)
+        model_key = jax.random.fold_in(model_parent, int(seed))
+
+        print(
+            f"\nRunning finite-size PC ({args.pc_infer_mode}) simulation "
+            f"(N={width}, H={n_hidden})...\n"
+        )
+        pc_losses, pc_fields = _train_finite_pc(
+            model_key,
+            results_dir=args.results_dir,
+            input_dim=input_dim,
+            output_dim=output_dim,
+            n_samples=args.n_samples,
+            n_hidden=n_hidden,
+            use_skips=args.use_skips,
+            act_fn=args.act_fn,
+            param_type=args.param_type,
+            param_lr=args.param_lr_pc,
+            gamma_0=args.gamma_0,
+            param_optim_id=args.param_optim,
+            n_train_iters=T_train,
+            infer_mode=infer_mode,
+            n_infer_iters=args.n_infer_iters,
+            activity_lr=args.activity_lr,
+            width=width,
+            loss_id=loss_id,
+            seed=seed,
+            X_input=X_input,
+            Y_target=Y_target,
+            collect_fields=False,
+            collect_h_k0=True,
+            collect_init_model=True,
+        )
+        pc_h_traj = pc_fields["h_k0_traj"]  # (n_hidden, T, P, N)
+        print(
+            f"PC final training loss: "
+            f"{float(np.asarray(pc_losses).flatten()[-1]):.4e}"
+        )
+
+        print(
+            f"\nRunning finite-size BP simulation "
+            f"(N={width}, H={n_hidden})...\n"
+        )
+        bp_losses, bp_h_traj = _train_finite_bp(
+            model_key,
+            results_dir=args.results_dir,
+            input_dim=input_dim,
+            output_dim=output_dim,
+            n_samples=args.n_samples,
+            n_hidden=n_hidden,
+            use_skips=args.use_skips,
+            act_fn=args.act_fn,
+            param_type=args.param_type,
+            param_lr=args.param_lr,
+            gamma_0=args.gamma_0,
+            param_optim_id=args.param_optim,
+            n_train_iters=T_train,
+            width=width,
+            loss_id=loss_id,
+            seed=seed,
+            X_input=X_input,
+            Y_target=Y_target,
+            collect_h_k0=True,
+            init_from=pc_fields["init_model"],
+        )
+        print(
+            f"BP final training loss: "
+            f"{float(np.asarray(bp_losses).flatten()[-1]):.4e}"
+        )
+
+        pc_kernels_by_t = {
+            t: _feature_kernels_from_h(pc_h_traj[:, t], phi_fn)
+            for t in kernel_times
+        }
+        bp_kernels_by_t = {
+            t: _feature_kernels_from_h(bp_h_traj[:, t], phi_fn)
+            for t in kernel_times
+        }
+        t0 = 0 if 0 in pc_kernels_by_t else kernel_times[0]
+        print("Sanity-checking PC vs BP feature kernels at t=0...")
+        _assert_init_pc_bp_cka(
+            pc_kernels_by_t[t0], bp_kernels_by_t[t0], seed=seed
+        )
+        pc_kernels_by_seed.append(pc_kernels_by_t)
+        bp_kernels_by_seed.append(bp_kernels_by_t)
+
+        if seed != plot_seed:
+            continue
+
+        plot_pc_bp_loss(
+            pc_losses,
+            bp_losses,
+            plots_dir=plots_dir,
+            n_hidden=n_hidden,
+            gamma_0=args.gamma_0,
+            activity_lr=args.activity_lr,
+            n_infer_iters=args.n_infer_iters,
+            width=width,
+        )
+
+        for t in heatmap_timepoints:
+            plot_final_kernel_grid(
+                [
+                    ("PC", kernels_to_correlations(pc_kernels_by_t[t])),
+                    ("Backprop", kernels_to_correlations(bp_kernels_by_t[t])),
+                ],
+                plots_dir=plots_dir,
+                gamma_0=args.gamma_0,
+                n_hidden=n_hidden,
+                activity_lr=args.activity_lr,
+                n_infer_iters=args.n_infer_iters,
+                width=width,
+                filename=f"feature_kernels_grid_t{t}.png",
+                share_clim=True,
+                vmin=-1.0,
+                vmax=1.0,
+                title=(
+                    rf"$C^{{{feat_tex}}}$ feature kernels "
+                    rf"($t={t}$, correlation)"
+                ),
+                dir_name="alignment",
+            )
+
+        displacement_records = []
+        alignment_records = []
+        change_alignment_records = []
+        for t in curve_timepoints:
+            for l in range(n_hidden):
+                pc_C0 = pc_kernels_by_t[t0][l]
+                bp_C0 = bp_kernels_by_t[t0][l]
+                pc_Ct = pc_kernels_by_t[t][l]
+                bp_Ct = bp_kernels_by_t[t][l]
+                displacement_records.append({
+                    "t": t,
+                    "layer": l,
+                    "method": "pc",
+                    "displacement": float(
+                        cosine_similarity(pc_C0, pc_Ct, eps=1e-30)
+                    ),
+                    "rel_displacement": float(
+                        relative_frobenius_displacement(
+                            pc_C0, pc_Ct, eps=1e-30
+                        )
+                    ),
+                })
+                displacement_records.append({
+                    "t": t,
+                    "layer": l,
+                    "method": "bp",
+                    "displacement": float(
+                        cosine_similarity(bp_C0, bp_Ct, eps=1e-30)
+                    ),
+                    "rel_displacement": float(
+                        relative_frobenius_displacement(
+                            bp_C0, bp_Ct, eps=1e-30
+                        )
+                    ),
+                })
+                alignment_records.append({
+                    "t": t,
+                    "layer": l,
+                    "alignment": float(
+                        centered_kernel_alignment(pc_Ct, bp_Ct, eps=1e-30)
+                    ),
+                })
+                if t != t0:
+                    change_alignment_records.append({
+                        "t": t,
+                        "layer": l,
+                        "alignment": float(
+                            centered_kernel_alignment(
+                                np.asarray(pc_Ct) - np.asarray(pc_C0),
+                                np.asarray(bp_Ct) - np.asarray(bp_C0),
+                                eps=1e-30,
+                            )
+                        ),
+                    })
+
+        plot_kernel_displacement_per_timepoint(
+            pd.DataFrame(displacement_records),
+            **plot_kw,
+        )
+        plot_kernel_displacement_per_timepoint(
+            pd.DataFrame(displacement_records),
+            metric="rel_frob",
+            **plot_kw,
+        )
+        plot_pc_bp_alignment_vs_time(
+            pd.DataFrame(alignment_records),
+            **plot_kw,
+        )
+        plot_pc_bp_alignment_vs_time(
+            pd.DataFrame(change_alignment_records),
+            ylabel=(
+                rf"$\cos(\widetilde{{\Delta C}}^{{{feat_tex},\ell}}"
+                rf"_{{\mathrm{{PC}}}}(t), "
+                rf"\widetilde{{\Delta C}}^{{{feat_tex},\ell}}"
+                rf"_{{\mathrm{{BP}}}}(t))$"
+            ),
+            filename="pc_bp_kernel_change_cosine_vs_time.png",
+            title=(
+                "PC vs backprop kernel-change alignment "
+                "(centered cosine)"
+            ),
+            **plot_kw,
+        )
+
+        pc_temporal_kernels = _sample_traced_feature_kernels_from_h_traj(
+            pc_h_traj, phi_fn
+        )
+        bp_temporal_kernels = _sample_traced_feature_kernels_from_h_traj(
+            bp_h_traj, phi_fn
+        )
+        plot_temporal_kernel_grid(
             [
-                ("PC", pc_kernels_by_t[t]),
-                ("Backprop", bp_kernels_by_t[t]),
+                ("PC", kernels_to_correlations(pc_temporal_kernels)),
+                ("Backprop", kernels_to_correlations(bp_temporal_kernels)),
             ],
             plots_dir=plots_dir,
             gamma_0=args.gamma_0,
@@ -422,86 +661,49 @@ if __name__ == "__main__":
             activity_lr=args.activity_lr,
             n_infer_iters=args.n_infer_iters,
             width=width,
-            filename=f"feature_kernels_grid_t{t}.png",
-            share_clim=True,
-            title=rf"$C^{{{feat_tex}}}$ feature kernels ($t={t}$)",
+            filename="temporal_kernels_grid.png",
             dir_name="alignment",
+            vmin=-1.0,
+            vmax=1.0,
+            title=(
+                rf"Sample-traced $C^{{{feat_tex}}}$ feature kernels "
+                rf"(correlation)"
+            ),
         )
 
-    # --- Kernel displacement from t0 and PC-BP alignment, per layer ---
-    t0 = timepoints[0]
-    displacement_records = []
-    alignment_records = []
-    for t in timepoints:
-        for l in range(n_hidden):
-            displacement_records.append({
-                "t": t,
-                "layer": l,
-                "method": "pc",
-                "displacement": float(
-                    cosine_similarity(
-                        pc_kernels_by_t[t0][l],
-                        pc_kernels_by_t[t][l],
-                        eps=1e-30,
-                    )
-                ),
-            })
-            displacement_records.append({
-                "t": t,
-                "layer": l,
-                "method": "bp",
-                "displacement": float(
-                    cosine_similarity(
-                        bp_kernels_by_t[t0][l],
-                        bp_kernels_by_t[t][l],
-                        eps=1e-30,
-                    )
-                ),
-            })
-            alignment_records.append({
-                "t": t,
-                "layer": l,
-                "alignment": float(
-                    cosine_similarity(
-                        pc_kernels_by_t[t][l],
-                        bp_kernels_by_t[t][l],
-                        eps=1e-30,
-                    )
-                ),
-            })
-
-    plot_kernel_displacement_per_timepoint(
-        pd.DataFrame(displacement_records),
-        **plot_kw,
-    )
-
-    plot_pc_bp_alignment_vs_time(
-        pd.DataFrame(alignment_records),
-        **plot_kw,
-    )
-
-    # --- Sample-traced temporal kernels (T x T): same grid scheme, one plot ---
-    pc_temporal_kernels = _sample_traced_feature_kernels_from_h_traj(
-        pc_h_traj, phi_fn
-    )
-    bp_temporal_kernels = _sample_traced_feature_kernels_from_h_traj(
-        bp_h_traj, phi_fn
-    )
-    plot_temporal_kernel_grid(
-        [
-            ("PC", pc_temporal_kernels),
-            ("Backprop", bp_temporal_kernels),
-        ],
-        plots_dir=plots_dir,
-        gamma_0=args.gamma_0,
-        n_hidden=n_hidden,
-        activity_lr=args.activity_lr,
-        n_infer_iters=args.n_infer_iters,
-        width=width,
-        filename="temporal_kernels_grid.png",
-        dir_name="alignment",
-        title=rf"Sample-traced $C^{{{feat_tex}}}$ feature kernels",
-    )
+    if n_seeds > 1:
+        print(
+            f"\nKernel concentration across {n_seeds} seeds "
+            f"(mean pairwise CKA)..."
+        )
+        conc_records = []
+        for t in curve_timepoints:
+            for l in range(n_hidden):
+                for method, by_seed in (
+                    ("pc", pc_kernels_by_seed),
+                    ("bp", bp_kernels_by_seed),
+                ):
+                    kernels = [seed_kernels[t][l] for seed_kernels in by_seed]
+                    cka_mean, cka_std = _mean_pairwise_cka(kernels)
+                    conc_records.append({
+                        "t": t,
+                        "layer": l,
+                        "method": method,
+                        "cka_mean": cka_mean,
+                        "cka_std": cka_std,
+                    })
+        conc_df = pd.DataFrame(conc_records)
+        plot_kernel_concentration_per_timepoint(
+            conc_df, n_seeds=n_seeds, **plot_kw
+        )
+        plot_kernel_concentration_vs_time(
+            conc_df, n_seeds=n_seeds, **plot_kw
+        )
+    else:
+        print(
+            "\nSkipping kernel-concentration analysis "
+            "(pass --n_seeds > 1 to enable)."
+        )
 
     if args.cleanup_npy:
         removed_dirs = cleanup_experiment_dirs(args.results_dir)
@@ -520,14 +722,14 @@ if __name__ == "__main__":
 ###########################
 
 # Infer mode (default)
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hidden 5 --width 10000 --gamma_0 1.0 --param_lr 0.1 --param_lr_pc 0.2 --activity_lr 0.01 --pc_infer_mode infer --n_infer_iters 5 --n_train_iters 20
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hidden 5 --width 10000 --gamma_0 1.0 --param_lr 0.1 --param_lr_pc 0.2 --activity_lr 0.01 --pc_infer_mode infer --n_infer_iters 5 --n_train_iters 21
 
-# Closed-form PC inference
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hidden 5 --width 10000 --gamma_0 1.0 --param_lr 0.1 --param_lr_pc 0.2 --pc_infer_mode closed_form --n_train_iters 20
+# Closed-form inference for PC
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hidden 5 --width 10000 --gamma_0 1.0 --param_lr 0.1 --param_lr_pc 0.2 --pc_infer_mode closed_form --n_train_iters 21
 
 
 ############ NONLINEAR ##################
 #########################################
 
 # Infer mode (default)
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 10 --n_hidden 3 --width 10000 --gamma_0 1.0 --param_lr 0.5 --param_lr_pc 1.0 --activity_lr 0.05 --pc_infer_mode infer --n_infer_iters 10 --n_train_iters 30 --act_fn tanh --dataset tiny-CIFAR10
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 10 --n_hidden 3 --width 10000 --gamma_0 1.0 --param_lr 0.5 --param_lr_pc 1.0 --activity_lr 0.05 --pc_infer_mode infer --n_infer_iters 100 --n_train_iters 31 --act_fn tanh --dataset tiny-CIFAR10

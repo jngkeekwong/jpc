@@ -1,8 +1,9 @@
 """PC DMFT theory vs finite-width analysis: kernels, width alignment, and loss.
 
 Kernel / width figures are selected by ``--plot_mode`` (default ``auto``).
-Loss curves are always produced, including overlays when ``--n_hiddens``,
-``--gamma_0s``, or ``--n_infer_iters`` contain multiple values.
+Per-combo theory vs finite-size loss curves are always produced; overlays
+are added when ``--n_hiddens``, ``--gamma_0s``, or ``--n_infer_iters``
+contain multiple values.
 
 Feature kernels: linear nets compare theory/finite ``C^h``; nonlinear
 nets compare theory ``C^phi`` (first return of
@@ -22,8 +23,9 @@ Kernel / width figures:
   width, first seed) and the ``width`` alignment sweep.
 - ``auto``: ``kernels`` if a single ``--widths`` value is given, else
   ``both``. Several ``--n_infer_iters`` always add a stacked ``K``-sweep
-  kernel grid and a per-layer displacement overlay (see loss figures);
-  they do not add extra per-``K`` kernel grids.
+  kernel grid and a per-layer displacement overlay (cosine and relative
+  Frobenius; see loss figures); they do not add extra per-``K`` kernel
+  grids.
 - ``--plot_temporal_kernels``: in addition to the final ``P x P`` grid,
   plot sample-traced ``T x T`` feature kernels at ``k=0`` (forward
   init; sample diagonal summed over ``μ``). Requires a single
@@ -31,22 +33,26 @@ Kernel / width figures:
   and ``--activity_lrs``. Rows match the kernel grid.
 
 Loss figures:
-- Single ``H``, ``gamma_0``, and ``K``: theory vs finite-size loss
-  (all widths) for that combination.
-- Several ``--n_hiddens``: overlay loss vs depth at the largest width.
-- Several ``--gamma_0s``: overlay loss vs ``gamma`` at the largest width.
-- Several ``--n_infer_iters``: overlay loss vs ``K`` at the largest
-  width, plus a stacked final-kernel grid (DMFT at the smallest ``K``,
-  then finite-size infer for increasing ``K``, then closed-form in the
-  linear case) and a per-layer displacement overlay (initial vs final
-  ``C^h``). DMFT is solved and plotted only for the smallest ``K``.
+- Every ``(H, gamma_0, K)`` combo: theory vs finite-size loss
+  (all widths when width plots run; else the largest width).
+- Several ``--n_hiddens``: additionally overlay loss vs depth at the
+  largest width.
+- Several ``--gamma_0s``: additionally overlay loss vs ``gamma`` at the
+  largest width.
+- Several ``--n_infer_iters``: additionally overlay loss vs ``K`` at the
+  largest width, plus a stacked final-kernel grid (DMFT at the smallest
+  ``K``, then finite-size infer for increasing ``K``, then closed-form
+  in the linear case) and a per-layer displacement overlay (initial vs
+  final ``C^h`` / ``C^phi``, cosine and relative Frobenius). DMFT is
+  solved and plotted only for the smallest ``K``.
   Linear nets also get one finite-size closed-form curve (independent
   of ``K``).
 - Several ``--n_infer_iters`` and several ``--gamma_0s``: the ``K``-sweep
   figures above are produced per ``gamma_0``, and one extra plot shows
   last-hidden-layer (``ℓ = H``) displacement vs ``gamma_0`` with one
   curve per ``K`` (DMFT at the smallest ``K``, finite infer, closed-form
-  in the linear case). ``--skip_theory`` omits the DMFT curve.
+  in the linear case), for both cosine and relative Frobenius.
+  ``--skip_theory`` omits the DMFT curve.
 
 ``--skip_theory`` skips DMFT on the kernel-grid-only path, on loss
 plots, and on the ``K``-sweep kernel grid / displacement (no DMFT row
@@ -70,6 +76,7 @@ from pathlib import Path
 
 import argparse
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -91,6 +98,7 @@ from experiments.dmft.utils import (
     empirical_pc_kernel,
     final_time_pc_kernel,
     pc_hidden_preactivations_and_errors,
+    relative_frobenius_displacement,
     sample_traced_empirical_pc_kernel,
     sample_traced_pc_kernel,
 )
@@ -133,6 +141,7 @@ def _train_finite_pc(
     Y_target,
     collect_fields=True,
     collect_h_k0=False,
+    collect_init_model=False,
 ):
     """Run one finite-width PC training job.
 
@@ -141,7 +150,9 @@ def _train_finite_pc(
     ``k=n_infer_iters`` of the trained network, plus untrained
     feedforward ``h_init`` (else ``None``). When ``collect_h_k0`` is
     True, ``fields["h_k0_traj"]`` is hidden ``h`` at ``k=0`` of every
-    training step, shape ``(n_hidden, T, P, N)``.
+    training step, shape ``(n_hidden, T, P, N)``. When
+    ``collect_init_model`` is True, ``fields["init_model"]`` is the
+    untrained ``jpc.make_mlp`` layer list (weights before any update).
     """
     save_dir = setup_pc_experiment(
         results_dir=results_dir,
@@ -194,6 +205,9 @@ def _train_finite_pc(
             [np.asarray(h, dtype=np.float32) for h in hs_init], axis=0
         )
     h_k0_steps = [] if collect_h_k0 else None
+    init_model = jax.tree.map(
+        lambda x: jnp.array(x) if eqx.is_array(x) else x, model
+    )
     _, model, skip_model = train_pcn(
         model=model,
         use_skips=use_skips,
@@ -214,7 +228,7 @@ def _train_finite_pc(
         h_k0_steps=h_k0_steps,
     )
     losses = np.load(f"{save_dir}/train_losses.npy")
-    if not collect_fields and not collect_h_k0:
+    if not collect_fields and not collect_h_k0 and not collect_init_model:
         return losses, None
     fields = {}
     if collect_fields:
@@ -233,6 +247,8 @@ def _train_finite_pc(
         fields["h_init"] = h_init
     if collect_h_k0:
         fields["h_k0_traj"] = np.stack(h_k0_steps, axis=1)
+    if collect_init_model:
+        fields["init_model"] = init_model
     return losses, fields
 
 
@@ -340,7 +356,7 @@ def _init_feature_kernels(fields, phi_fn):
 
 
 def _kernel_displacement_records(init_kernels, final_kernels, **meta):
-    """Per-layer cosine similarity of initial vs final feature kernels."""
+    """Per-layer cosine and relative-Frobenius displacement of kernels."""
     if len(init_kernels) != len(final_kernels):
         raise ValueError(
             "init/final kernel counts differ: "
@@ -354,6 +370,9 @@ def _kernel_displacement_records(init_kernels, final_kernels, **meta):
                 "layer": l,
                 "displacement": float(
                     cosine_similarity(C0, CT, eps=1e-30)
+                ),
+                "rel_displacement": float(
+                    relative_frobenius_displacement(C0, CT, eps=1e-30)
                 ),
             }
         )
@@ -515,8 +534,8 @@ def _plot_k_sweep_kernels_and_displacement(
             )
         )
     if disp_records:
-        plot_pc_k_sweep_displacement(
-            pd.DataFrame(disp_records),
+        disp_df = pd.DataFrame(disp_records)
+        k_sweep_kw = dict(
             plots_dir=plots_dir,
             n_hidden=n_hidden,
             gamma_0=gamma_0,
@@ -524,6 +543,10 @@ def _plot_k_sweep_kernels_and_displacement(
             width=width,
             dir_name="convergence",
             feature_symbol=feature_symbol,
+        )
+        plot_pc_k_sweep_displacement(disp_df, **k_sweep_kw)
+        plot_pc_k_sweep_displacement(
+            disp_df, metric="rel_frob", **k_sweep_kw
         )
     return disp_records
 
@@ -1160,26 +1183,27 @@ if __name__ == "__main__":
                                 plots_dir = os.path.join(
                                     args.results_dir, "plots"
                                 )
-                                if not overlay_any:
-                                    plot_pc_theory_vs_finite_loss(
-                                        pc_dmft_loss=(
-                                            pc_dmft_loss
-                                            if pc_dmft_loss is not None
-                                            else jnp.zeros(T_train)
-                                        ),
-                                        finite_df=pd.DataFrame(
-                                            finite_pc_records
-                                        ),
-                                        plots_dir=plots_dir,
-                                        gamma_0=gamma_0,
-                                        n_hidden=n_hidden,
-                                        activity_lr=activity_lr,
-                                        n_infer_iters=K_inf,
-                                        update_mode="infer",
-                                        skip_theory=skip_loss_theory
-                                        or pc_dmft_loss is None,
-                                        skip_finite=args.skip_finite,
-                                    )
+                                # Per-combo theory vs finite loss (also when
+                                # sweeping H / gamma / K; overlays are extra).
+                                plot_pc_theory_vs_finite_loss(
+                                    pc_dmft_loss=(
+                                        pc_dmft_loss
+                                        if pc_dmft_loss is not None
+                                        else jnp.zeros(T_train)
+                                    ),
+                                    finite_df=pd.DataFrame(
+                                        finite_pc_records
+                                    ),
+                                    plots_dir=plots_dir,
+                                    gamma_0=gamma_0,
+                                    n_hidden=n_hidden,
+                                    activity_lr=activity_lr,
+                                    n_infer_iters=K_inf,
+                                    update_mode="infer",
+                                    skip_theory=skip_loss_theory
+                                    or pc_dmft_loss is None,
+                                    skip_finite=args.skip_finite,
+                                )
 
                                 if (
                                     kernels_this_K
@@ -1447,14 +1471,19 @@ if __name__ == "__main__":
                     if "width" in sub.columns
                     else None
                 )
-                plot_pc_last_layer_displacement_vs_gamma(
-                    sub,
+                last_layer_kw = dict(
                     plots_dir=plots_root,
                     n_hidden=n_hidden_k,
                     activity_lr=activity_lr_k,
                     width=width_k,
                     dir_name="convergence",
                     feature_symbol=feat_sym,
+                )
+                plot_pc_last_layer_displacement_vs_gamma(
+                    sub, **last_layer_kw
+                )
+                plot_pc_last_layer_displacement_vs_gamma(
+                    sub, metric="rel_frob", **last_layer_kw
                 )
 
     if plot_width:
@@ -1516,7 +1545,7 @@ if __name__ == "__main__":
 # CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10000 --gamma_0s 0.1 0.5 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 20 50 200 500 --n_train_iters 20 --n_fixed_point_steps 100 --pc_damping 0.05 --results_dir results_KG
 
 # Across widths (convergence of kernels + plot final kernels)
-# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 5 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 500 --pc_damping 0.05 --pc_tolerance 1e-10 --n_seeds 3 --results_dir results_W
+# CUDA_VISIBLE_DEVICES=1 python analyse_convergence.py --n_samples 20 --n_hiddens 2 3 4 5 --widths 10 25 100 250 1000 2500 10000 --plot_mode both --gamma_0s 1.0 --param_lr_pc 0.2 --activity_lrs 0.01 --n_infer_iters 5 --n_train_iters 20 --n_fixed_point_steps 500 --pc_damping 0.05 --pc_tolerance 1e-10 --n_seeds 3 --results_dir results_W
 
 
 ############ NONLINEAR ##################

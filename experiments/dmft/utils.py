@@ -114,6 +114,116 @@ def cosine_similarity(a, b, axis=None, eps=1e-10):
     return num / denom
 
 
+def relative_frobenius_displacement(C0, Ct, eps=1e-30):
+    """Relative Frobenius displacement ``||Ct - C0||_F / ||C0||_F``.
+
+    Unlike cosine similarity, this tracks magnitude change as well as
+    direction. ``C0`` / ``Ct`` are flattened; mismatched sizes are
+    truncated to the shared leading length (same convention as
+    ``cosine_similarity``).
+    """
+    C0 = np.asarray(C0, dtype=np.float64).reshape(-1)
+    Ct = np.asarray(Ct, dtype=np.float64).reshape(-1)
+    n = min(C0.size, Ct.size)
+    C0, Ct = C0[:n], Ct[:n]
+    return float(np.linalg.norm(Ct - C0) / (np.linalg.norm(C0) + eps))
+
+
+def _center_gram(K):
+    """Double-center a Gram matrix: ``H K H`` with ``H = I - 11^T / n``."""
+    K = np.asarray(K, dtype=np.float64)
+    row_mean = K.mean(axis=1, keepdims=True)
+    col_mean = K.mean(axis=0, keepdims=True)
+    return K - row_mean - col_mean + K.mean()
+
+
+def centered_kernel_alignment(K, L, eps=1e-30):
+    """Linear CKA (Kornblith et al.): cosine similarity of centered Grams.
+
+    When both centered kernels are numerically zero (e.g. ``C(t)-C(0)``
+    at ``t=0``), returns ``1.0``, matching the limit
+    ``CKA(εI, εI) → 1``.
+    """
+    K = np.asarray(K, dtype=np.float64)
+    L = np.asarray(L, dtype=np.float64)
+    if K.shape != L.shape:
+        raise ValueError(
+            f"CKA requires matching shapes, got {K.shape} vs {L.shape}"
+        )
+    Kc = _center_gram(K)
+    Lc = _center_gram(L)
+    na = np.linalg.norm(Kc)
+    nb = np.linalg.norm(Lc)
+    denom = na * nb
+    if denom < eps:
+        # Both zero: CKA(εI, εI) → 1. One zero: undefined, treat as 0.
+        return 1.0 if na < eps and nb < eps else 0.0
+    return float(np.sum(Kc * Lc) / denom)
+
+
+def gram_to_correlation(C, eps=1e-30):
+    """Convert a Gram / kernel matrix to a correlation matrix.
+
+    ``R_ij = C_ij / sqrt(C_ii C_jj)``. Non-positive diagonals yield a
+    zero row/column (no finite correlation).
+    """
+    C = np.asarray(C, dtype=np.float64)
+    d = np.sqrt(np.maximum(np.diag(C), 0.0))
+    denom = np.outer(d, d)
+    R = np.zeros_like(C)
+    np.divide(C, denom, out=R, where=denom > eps)
+    return R
+
+
+def kernels_to_correlations(kernels, eps=1e-30):
+    """Map a sequence of Gram matrices to correlation matrices."""
+    return [gram_to_correlation(K, eps=eps) for K in kernels]
+
+
+def _as_layer_list(model):
+    if isinstance(model, (list, tuple)):
+        return list(model)
+    return list(model.layers)
+
+
+def copy_mlp_linear_params(src_model, dst_model):
+    """Copy Linear weights (and biases) from ``src_model`` onto ``dst_model``.
+
+    ``src_model`` is a ``jpc.make_mlp`` layer list (or anything with a
+    ``.layers`` attribute of ``Sequential([Lambda, Linear])`` blocks);
+    ``dst_model`` is the BP ``MLP``. Returns a new ``dst_model``. Layer
+    counts and weight shapes must match.
+    """
+    src_layers = _as_layer_list(src_model)
+    dst_layers = _as_layer_list(dst_model)
+    if len(src_layers) != len(dst_layers):
+        raise ValueError(
+            "src/dst layer counts differ: "
+            f"{len(src_layers)} vs {len(dst_layers)}"
+        )
+    new_layers = []
+    for i, (s_layer, d_layer) in enumerate(zip(src_layers, dst_layers)):
+        s_lin, d_lin = s_layer[1], d_layer[1]
+        if s_lin.weight.shape != d_lin.weight.shape:
+            raise ValueError(
+                f"layer {i} weight shape {tuple(s_lin.weight.shape)} vs "
+                f"{tuple(d_lin.weight.shape)}"
+            )
+        d_lin = eqx.tree_at(
+            lambda l: l.weight, d_lin, jnp.array(s_lin.weight)
+        )
+        if s_lin.bias is not None:
+            if d_lin.bias is None:
+                raise ValueError(
+                    f"layer {i}: src has a bias but dst does not"
+                )
+            d_lin = eqx.tree_at(
+                lambda l: l.bias, d_lin, jnp.array(s_lin.bias)
+            )
+        new_layers.append(eqx.tree_at(lambda s: s[1], d_layer, d_lin))
+    return eqx.tree_at(lambda m: m.layers, dst_model, new_layers)
+
+
 def pc_hidden_preactivations_and_errors(
     model,
     skip_model,
