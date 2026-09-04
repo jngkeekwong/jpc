@@ -58,6 +58,12 @@ the left). Verbose run output is written to
   ``L*`` (by loss).
 - Sample-traced temporal kernels over the full time trajectory (by
   time) or over the loss-matched frames (by loss).
+- Train vs test snapshot: PC–BP CKA and kernel–target CKA vs layer,
+  using the training kernels at the last time / last overlap ``L*``
+  and feedforward feature kernels on a held-out set of the same size
+  (``pc_bp_kernel_alignment_test.png``,
+  ``kernel_target_alignment_test.png``), plus a test-set kernel grid
+  (``feature_kernels_grid_test.png``).
 - If ``--n_seeds > 1``: kernel concentration across weight-init seeds
   vs layer and vs time / loss. Skipped when ``--n_seeds`` is 1.
 
@@ -66,7 +72,13 @@ is initialized from the weight-init stream; BP copies those Linear
 weights so both networks start from the same parameters. At ``t=0`` the
 script asserts that PC–BP kernel CKA is close to 1 (the mismatch
 ``1 - CKA`` is small). PC and BP always train on the same ``(X, y)``.
-Additional seeds (``--n_seeds``) vary only the weight-init stream.
+A held-out test set of the same size is drawn from a child of the
+dataset stream (official test split for ``tiny-CIFAR10`` / CIFAR-10 /
+Fashion-MNIST). Test feature kernels are feedforward ``h`` at ``k=0``
+at the same training snapshots as the train kernels: last step
+``t=T-1`` (by time) or last overlap ``L*`` (by loss; PC and BP may
+use different times). Additional seeds (``--n_seeds``) vary only the
+weight-init stream.
 
 Use the ``PC_dmft_env`` conda environment:
     /data/ndcn-computational-neuroscience/mert5001/envs/PC_dmft_env/bin/python analyse_alignment.py
@@ -129,6 +141,8 @@ from plot_dmft_results import (
     plot_pc_bp_subspace_overlap_vs_time,
     plot_temporal_kernel_effective_rank_vs_layer,
     plot_temporal_pc_bp_alignment_vs_layer,
+    plot_pc_bp_kernel_alignment_test_vs_layer,
+    plot_kernel_target_alignment_test_vs_layer,
 )
 
 _TERMINAL = sys.stdout
@@ -616,6 +630,103 @@ def _plot_temporal_kernel_figures(
     )
 
 
+def _collect_train_test_alignment_records(
+    pc_train_kernels,
+    bp_train_kernels,
+    pc_test_kernels,
+    bp_test_kernels,
+    C_y_train,
+    C_y_test,
+    n_hidden,
+):
+    """PC–BP CKA and kernel–target CKA on train vs test snapshots."""
+    pc_bp_records = []
+    target_records = []
+    for split, pc_ks, bp_ks, C_y in (
+        ("train", pc_train_kernels, bp_train_kernels, C_y_train),
+        ("test", pc_test_kernels, bp_test_kernels, C_y_test),
+    ):
+        for l in range(n_hidden):
+            pc_bp_records.append({
+                "layer": l,
+                "split": split,
+                "alignment": float(
+                    centered_kernel_alignment(
+                        pc_ks[l], bp_ks[l], eps=1e-30
+                    )
+                ),
+            })
+            for method, Ct in (("pc", pc_ks[l]), ("bp", bp_ks[l])):
+                target_records.append({
+                    "layer": l,
+                    "method": method,
+                    "split": split,
+                    "alignment": float(
+                        centered_kernel_alignment(Ct, C_y, eps=1e-30)
+                    ),
+                })
+    return pd.DataFrame(pc_bp_records), pd.DataFrame(target_records)
+
+
+def _plot_train_test_kernel_suite(
+    pc_train_kernels,
+    bp_train_kernels,
+    pc_test_kernels,
+    bp_test_kernels,
+    C_y_train,
+    C_y_test,
+    plot_kw,
+    feat_tex,
+    n_hidden,
+    *,
+    title_note="",
+):
+    """Train vs test PC–BP / target CKA vs layer, plus test kernel grid."""
+    pc_bp_df, target_df = _collect_train_test_alignment_records(
+        pc_train_kernels,
+        bp_train_kernels,
+        pc_test_kernels,
+        bp_test_kernels,
+        C_y_train,
+        C_y_test,
+        n_hidden,
+    )
+    pc_bp_title = "PC vs backprop feature-kernel alignment (train vs test)"
+    target_title = "Feature-kernel alignment with the target (train vs test)"
+    if title_note:
+        pc_bp_title += title_note
+        target_title += title_note
+    plot_pc_bp_kernel_alignment_test_vs_layer(
+        pc_bp_df, title=pc_bp_title, **plot_kw
+    )
+    plot_kernel_target_alignment_test_vs_layer(
+        target_df, title=target_title, **plot_kw
+    )
+    grid_title = (
+        rf"$C^{{{feat_tex}}}$ feature kernels (test, correlation)"
+    )
+    if title_note:
+        grid_title = (
+            rf"$C^{{{feat_tex}}}$ feature kernels "
+            rf"(test{title_note}, correlation)"
+        )
+    plot_final_kernel_grid(
+        [
+            ("PC", kernels_to_correlations(pc_test_kernels)),
+            ("Backprop", kernels_to_correlations(bp_test_kernels)),
+        ],
+        filename="feature_kernels_grid_test.png",
+        share_clim=True,
+        vmin=-1.0,
+        vmax=1.0,
+        title=grid_title,
+        **{k: plot_kw[k] for k in (
+            "plots_dir", "gamma_0", "n_hidden", "activity_lr",
+            "n_infer_iters", "width", "dir_name",
+        ) if k in plot_kw},
+    )
+
+
 _INIT_CKA_ATOL = 1e-3
 _SUBSPACE_KS = (1, 3, 5)
 
@@ -718,14 +829,19 @@ def _train_finite_bp(
     Y_target,
     collect_h_k0=True,
     init_from=None,
+    X_eval=None,
+    phi_fn=None,
+    collect_eval_kernels=False,
 ):
     """Run one finite-width BP training job.
 
-    Returns ``(losses, h_k0_traj)``. ``h_k0_traj`` has shape
-    ``(n_hidden, T, P, N)`` — the hidden pre-activations ``h^l`` (see
-    ``bp_hidden_preactivations`` in ``experiments.dmft.utils``) at every
-    training step, before that step's parameter update — or ``None`` if
-    ``collect_h_k0`` is False.
+    Returns ``(losses, h_k0_traj, eval_kernels)``. ``h_k0_traj`` has
+    shape ``(n_hidden, T, P, N)`` — the hidden pre-activations ``h^l``
+    (see ``bp_hidden_preactivations`` in ``experiments.dmft.utils``) at
+    every training step, before that step's parameter update — or
+    ``None`` if ``collect_h_k0`` is False. ``eval_kernels`` is a list of
+    per-layer test-set feature kernels, one list per training step, or
+    ``None`` if ``collect_eval_kernels`` is False.
 
     If ``init_from`` is given (a ``jpc.make_mlp`` layer list or BP
     ``MLP``), Linear weights are copied onto the BP network after
@@ -763,6 +879,22 @@ def _train_finite_bp(
         model = copy_mlp_linear_params(init_from, model)
         _term("Copied PC initial Linear weights onto the BP network.")
     h_k0_steps = [] if collect_h_k0 else None
+    eval_kernels = [] if collect_eval_kernels else None
+    if collect_eval_kernels:
+        if X_eval is None or phi_fn is None:
+            raise ValueError(
+                "collect_eval_kernels requires X_eval and phi_fn"
+            )
+
+        def _record_eval_kernels(hs):
+            h = np.stack(
+                [np.asarray(x, dtype=np.float32) for x in hs], axis=0
+            )
+            eval_kernels.append(_feature_kernels_from_h(h, phi_fn))
+
+        h_k0_eval_callback = _record_eval_kernels
+    else:
+        h_k0_eval_callback = None
     train_bpn(
         model=model,
         use_skips=use_skips,
@@ -778,10 +910,12 @@ def _train_finite_bp(
         store_grads=False,
         loss_id=loss_id,
         h_k0_steps=h_k0_steps,
+        X_eval=X_eval,
+        h_k0_eval_callback=h_k0_eval_callback,
     )
     losses = np.load(f"{save_dir}/losses.npy")
     h_k0_traj = np.stack(h_k0_steps, axis=1) if collect_h_k0 else None
-    return losses, h_k0_traj
+    return losses, h_k0_traj, eval_kernels
 
 
 if __name__ == "__main__":
@@ -933,19 +1067,27 @@ if __name__ == "__main__":
     # Two independent children of --seed: dataset and weight init. BP
     # copies the PC Linear weights after construction, so both networks
     # start from the same parameters (the BP constructor key is unused
-    # for the copied weights).
+    # for the copied weights). A further split of the dataset stream
+    # draws an independent test set of the same size.
     data_key, model_parent = jax.random.split(jax.random.PRNGKey(args.seed))
+    train_key, test_key = jax.random.split(data_key)
 
     if args.dataset == "toy":
         X, y = create_toy_dataset(
-            key=data_key, D=args.input_dim, P=args.n_samples
+            key=train_key, D=args.input_dim, P=args.n_samples
+        )
+        X_test, y_test = create_toy_dataset(
+            key=test_key, D=args.input_dim, P=args.n_samples
         )
         input_dim = args.input_dim
         output_dim = 1
     elif args.dataset == "tiny-CIFAR10":
         input_dim = CIFAR_GRAY_DIM
         X, y = create_tiny_cifar10_dataset(
-            key=data_key, D=input_dim, P=args.n_samples
+            key=train_key, D=input_dim, P=args.n_samples, train=True
+        )
+        X_test, y_test = create_tiny_cifar10_dataset(
+            key=test_key, D=input_dim, P=args.n_samples, train=False
         )
         output_dim = 1
         print(f"Input dim: {input_dim}, Output dim: {output_dim}")
@@ -953,11 +1095,12 @@ if __name__ == "__main__":
         from torch import Generator as TorchGenerator
 
         loader_gen = TorchGenerator()
-        loader_gen.manual_seed(int(np.asarray(data_key)[0]) & 0x7FFFFFFF)
-        train_loader, _ = get_dataloaders(
+        loader_gen.manual_seed(int(np.asarray(train_key)[0]) & 0x7FFFFFFF)
+        train_loader, test_loader = get_dataloaders(
             args.dataset, args.n_samples, generator=loader_gen
         )
         img_batch, label_batch = next(iter(train_loader))
+        img_batch_test, label_batch_test = next(iter(test_loader))
 
         input_dim = img_batch.shape[1]
         output_dim = label_batch.shape[1]
@@ -965,11 +1108,17 @@ if __name__ == "__main__":
 
         X = img_batch.numpy().T
         y = label_batch.numpy()
+        X_test = img_batch_test.numpy().T
+        y_test = label_batch_test.numpy()
 
     X_input = jnp.asarray(X.T, dtype=jnp.float32)
     Y_target = y[:, None] if y.ndim == 1 else y
     Y_target = jnp.asarray(Y_target, dtype=jnp.float32)
+    X_test_input = jnp.asarray(X_test.T, dtype=jnp.float32)
+    Y_test = y_test[:, None] if y_test.ndim == 1 else y_test
+    Y_test = jnp.asarray(Y_test, dtype=jnp.float32)
     C_y = _target_kernel(Y_target)
+    C_y_test = _target_kernel(Y_test)
     C_x = _input_kernel(X_input)
     n_label_cols = 1 if np.asarray(Y_target).ndim == 1 else int(
         np.asarray(Y_target).shape[1]
@@ -978,6 +1127,13 @@ if __name__ == "__main__":
         f"Target kernel C^y shape: {C_y.shape}, "
         f"input kernel C^x shape: {C_x.shape}"
     )
+    print(f"Test target kernel C^y_test shape: {C_y_test.shape}")
+    if int(X_test_input.shape[0]) != int(X_input.shape[0]):
+        raise ValueError(
+            "test set size must match the training set: "
+            f"got P_train={int(X_input.shape[0])}, "
+            f"P_test={int(X_test_input.shape[0])}"
+        )
     loss_id = (
         "mse" if args.dataset in ("toy", "tiny-CIFAR10") else args.loss_id
     )
@@ -1067,8 +1223,12 @@ if __name__ == "__main__":
             collect_fields=False,
             collect_h_k0=True,
             collect_init_model=True,
+            X_eval=X_test_input if seed == plot_seed else None,
+            phi_fn=phi_fn if seed == plot_seed else None,
+            collect_eval_kernels=(seed == plot_seed),
         )
         pc_h_traj = pc_fields["h_k0_traj"]  # (n_hidden, T, P, N)
+        pc_eval_kernels = pc_fields.get("eval_kernels")
         _term(
             f"PC final training loss: "
             f"{float(np.asarray(pc_losses).flatten()[-1]):.4e}"
@@ -1078,7 +1238,7 @@ if __name__ == "__main__":
             f"\nRunning finite-size BP simulation "
             f"(N={width}, H={n_hidden})...\n"
         )
-        bp_losses, bp_h_traj = _train_finite_bp(
+        bp_losses, bp_h_traj, bp_eval_kernels = _train_finite_bp(
             model_key,
             results_dir=args.results_dir,
             input_dim=input_dim,
@@ -1099,6 +1259,9 @@ if __name__ == "__main__":
             Y_target=Y_target,
             collect_h_k0=True,
             init_from=pc_fields["init_model"],
+            X_eval=X_test_input if seed == plot_seed else None,
+            phi_fn=phi_fn if seed == plot_seed else None,
+            collect_eval_kernels=(seed == plot_seed),
         )
         _term(
             f"BP final training loss: "
@@ -1106,6 +1269,16 @@ if __name__ == "__main__":
         )
         pc_losses = np.asarray(pc_losses, dtype=float).flatten()
         bp_losses = np.asarray(bp_losses, dtype=float).flatten()
+        if pc_eval_kernels is not None and bp_eval_kernels is not None:
+            if (
+                len(pc_eval_kernels) != T_train
+                or len(bp_eval_kernels) != T_train
+            ):
+                raise RuntimeError(
+                    "eval kernel length mismatch: "
+                    f"PC={len(pc_eval_kernels)}, BP={len(bp_eval_kernels)}, "
+                    f"T={T_train}"
+                )
 
         pc_kernels_by_t = {
             t: _feature_kernels_from_h(pc_h_traj[:, t], phi_fn)
@@ -1260,6 +1433,20 @@ if __name__ == "__main__":
             ylabel=r"$t'$",
         )
 
+        print("Train vs test kernels (time-indexed)...")
+        _plot_train_test_kernel_suite(
+            pc_kernels_by_t[t_final],
+            bp_kernels_by_t[t_final],
+            pc_eval_kernels[t_final],
+            bp_eval_kernels[t_final],
+            C_y,
+            C_y_test,
+            plot_kw_time,
+            feat_tex,
+            n_hidden,
+            title_note=rf" ($t={t_final}$)",
+        )
+
         if plot_loss_matched:
             plot_pc_bp_loss_matched_times(
                 pc_losses,
@@ -1373,6 +1560,23 @@ if __name__ == "__main__":
                 xlabel=r"$L$",
                 ylabel=r"$L'$",
                 title_note=" (loss-matched)",
+            )
+
+            print("Train vs test kernels (loss-matched)...")
+            _plot_train_test_kernel_suite(
+                pc_kernels_by_t[t_pc_lo],
+                bp_kernels_by_t[t_bp_lo],
+                pc_eval_kernels[t_pc_lo],
+                bp_eval_kernels[t_bp_lo],
+                C_y,
+                C_y_test,
+                plot_kw_loss,
+                feat_tex,
+                n_hidden,
+                title_note=(
+                    rf" ($L={L_lo:.2e}$, $t_{{\mathrm{{PC}}}}={t_pc_lo}$, "
+                    rf"$t_{{\mathrm{{BP}}}}={t_bp_lo}$)"
+                ),
             )
 
     if n_seeds > 1:

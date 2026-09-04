@@ -30,12 +30,14 @@ def create_toy_dataset(key, D, P):
 CIFAR_GRAY_DIM = 32 * 32
 
 
-def create_tiny_cifar10_dataset(key, D, P, class0=0, class1=1):
+def create_tiny_cifar10_dataset(key, D, P, class0=0, class1=1, train=True):
     """Subsample a binary grayscale CIFAR-10 dataset.
 
     Loads CIFAR-10 via ``experiments.datasets.CIFAR10``, converts RGB
     images to grayscale, and draws ``P // 2`` examples from each of two
-    classes. Labels are mapped to ``{-1, +1}``.
+    classes. Labels are mapped to ``{-1, +1}``. ``train=True`` samples
+    the official train split; ``train=False`` samples the official test
+    split.
 
     Args:
         key: JAX PRNG key for sampling indices.
@@ -43,6 +45,7 @@ def create_tiny_cifar10_dataset(key, D, P, class0=0, class1=1):
         P: Number of samples (must be even).
         class0: CIFAR-10 class mapped to ``-1`` (default: airplane).
         class1: CIFAR-10 class mapped to ``+1`` (default: automobile).
+        train: If True, sample the train split; else the test split.
 
     Returns:
         X: array of shape ``(D, P)``.
@@ -56,7 +59,7 @@ def create_tiny_cifar10_dataset(key, D, P, class0=0, class1=1):
         raise ValueError(f"P must be even so classes are balanced, got P={P}.")
 
     dataset = CIFAR10(
-        train=True,
+        train=train,
         normalise=False,
         flatten=False,
         save_dir=str(Path(__file__).resolve().parent / "datasets" / "cifar10"),
@@ -666,6 +669,8 @@ def train_pcn(
       save_dir,
       store_grads=False,
       h_k0_steps=None,
+      X_eval=None,
+      h_k0_eval_callback=None,
 ):
     """Train a PC network.
 
@@ -680,8 +685,13 @@ def train_pcn(
     unless ``store_grads`` is True. If ``h_k0_steps`` is a list, each
     training step appends hidden ``h`` at ``k=0`` (feedforward init,
     before the parameter update) with shape ``(n_hidden, P, N)``.
+    ``X_eval`` / ``h_k0_eval_callback`` optionally record the same
+    feedforward ``h`` on a held-out batch at those snapshots: the
+    callback is called with a list of ``(P, N)`` hidden activations.
     """
     os.makedirs(save_dir, exist_ok=True)
+    if h_k0_eval_callback is not None and X_eval is None:
+        raise ValueError("h_k0_eval_callback requires X_eval")
 
     depth = len(model)
     skip_model = jpc.make_skip_model(depth) if use_skips else None
@@ -734,6 +744,23 @@ def train_pcn(
                     axis=0,
                 )
             )
+        if h_k0_eval_callback is not None:
+            activities_eval = jpc.init_activities_with_ffwd(
+                model=model,
+                input=X_eval,
+                skip_model=skip_model,
+                param_type=param_type,
+                gamma=gamma_0,
+            )
+            hs_eval, _ = pc_hidden_preactivations_and_errors(
+                model=model,
+                skip_model=skip_model,
+                activities=activities_eval,
+                x=X_eval,
+                param_type=param_type,
+                gamma=gamma_0,
+            )
+            h_k0_eval_callback(hs_eval)
         if loss_id == "mse":
             train_loss = jpc.mse_loss(activities[-1], Y_target)
         else:
@@ -844,6 +871,8 @@ def train_bpn(
       save_dir,
       store_grads=False,
       h_k0_steps=None,
+      X_eval=None,
+      h_k0_eval_callback=None,
 ):
     """Train a finite-width BP MLP.
 
@@ -852,8 +881,13 @@ def train_bpn(
     that step's parameter update, with shape ``(n_hidden, P, N)`` -
     mirroring ``train_pcn``'s ``h_k0_steps`` so PC and BP feature-kernel
     trajectories can be compared on equal footing.
+    ``X_eval`` / ``h_k0_eval_callback`` optionally record the same
+    feedforward ``h`` on a held-out batch at those snapshots: the
+    callback is called with a list of ``(P, N)`` hidden activations.
     """
     os.makedirs(save_dir, exist_ok=True)
+    if h_k0_eval_callback is not None and X_eval is None:
+        raise ValueError("h_k0_eval_callback requires X_eval")
 
     # Optimiser
     optim = configure_param_optim(
@@ -894,6 +928,9 @@ def train_bpn(
                     [np.asarray(h, dtype=np.float32) for h in hs], axis=0
                 )
             )
+        if h_k0_eval_callback is not None:
+            hs_eval = bp_hidden_preactivations(model, X_eval)
+            h_k0_eval_callback(hs_eval)
 
         # Record loss before the parameter update to match get_Delta / DMFT
         # step indexing (pre-update residual).

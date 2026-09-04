@@ -1397,6 +1397,11 @@ _PC_BP_STYLES = (
     ("bp", "tab:orange", "s", "Backprop"),
 )
 
+_SPLIT_STYLES = (
+    ("train", "tab:blue", "o", "-", "train"),
+    ("test", "tab:orange", "s", "--", "test"),
+)
+
 
 def _fig_param_suffix(
     n_hidden=None, width=None, gamma_0=None, activity_lr=None
@@ -1446,6 +1451,28 @@ def _plot_pc_bp_series(ax, sub, *, x_col, value_col, markersize, label_prefix=""
             marker=marker,
             markersize=markersize,
             color=color,
+            label=label,
+        )
+
+
+def _plot_train_test_series(
+    ax, sub, *, x_col, value_col, markersize, label_prefix=""
+):
+    """Overlay train and test curves on ``ax`` from a per-layer slice."""
+    for split, color, marker, linestyle, label in _SPLIT_STYLES:
+        ssub = sub[sub["split"] == split].sort_values(x_col)
+        if not len(ssub):
+            continue
+        x = np.asarray(ssub[x_col], dtype=float)
+        values = np.asarray(ssub[value_col], dtype=float)
+        _warn_if_nonfinite(f"{label_prefix}{split}", values)
+        ax.plot(
+            x,
+            values,
+            marker=marker,
+            markersize=markersize,
+            color=color,
+            linestyle=linestyle,
             label=label,
         )
 
@@ -2116,6 +2143,173 @@ def plot_temporal_pc_bp_alignment_vs_layer(
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
     print(f"Temporal PC-BP kernel alignment saved to {save_path}")
+    return save_path
+
+
+def plot_pc_bp_kernel_alignment_test_vs_layer(
+    alignment_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+    ylabel=None,
+    title=None,
+    filename="pc_bp_kernel_alignment_test.png",
+):
+    """PC–BP CKA of snapshot feature kernels vs layer, train vs test.
+
+    ``alignment_df`` must have columns ``layer``, ``split`` (``train`` /
+    ``test``), and ``alignment``.
+    """
+    if alignment_df is None or len(alignment_df) == 0:
+        print("No train/test PC-BP alignment records to plot.")
+        return None
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    sym = _feature_kernel_tex(feature_symbol)
+    plot_df = alignment_df.copy()
+    plot_df["layer_display"] = plot_df["layer"].astype(int) + 1
+    _warn_if_nonfinite(
+        "train/test pc-bp alignment",
+        np.asarray(plot_df["alignment"], dtype=float),
+    )
+    ylim = _data_ylim(plot_df["alignment"], invert=False, ymin_floor=0.0)
+
+    plt.figure(figsize=(5.5, 3.6))
+    ax = plt.gca()
+    _plot_train_test_series(
+        ax,
+        plot_df,
+        x_col="layer_display",
+        value_col="alignment",
+        markersize=8,
+        label_prefix="pc-bp alignment ",
+    )
+    layers = sorted(plot_df["layer_display"].unique())
+    ax.set_xticks(layers)
+    ax.set_xlabel(r"layer $\ell$")
+    if ylabel is None:
+        ylabel = (
+            rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}_{{\mathrm{{PC}}}}, "
+            rf"C^{{{sym},\ell}}_{{\mathrm{{BP}}}})$"
+        )
+    ax.set_ylabel(ylabel)
+    _maybe_set_ylim(ax, ylim)
+    ax.grid(True, alpha=0.4)
+    ax.legend(fontsize=8)
+    if title is None:
+        title = "PC vs backprop feature-kernel alignment (train vs test)"
+    ax.set_title(
+        title
+        + _fig_param_suffix(
+            n_hidden=n_hidden,
+            width=width,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+        )
+    )
+    plt.tight_layout()
+    save_path = os.path.join(out_dir, filename)
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+    print(f"Train/test PC-BP kernel alignment saved to {save_path}")
+    return save_path
+
+
+def plot_kernel_target_alignment_test_vs_layer(
+    alignment_df,
+    plots_dir,
+    n_hidden=None,
+    gamma_0=None,
+    activity_lr=None,
+    n_infer_iters=None,
+    width=None,
+    dir_name="alignment",
+    feature_symbol="h",
+    ylabel=None,
+    title=None,
+    filename="kernel_target_alignment_test.png",
+):
+    """CKA of snapshot feature kernels with ``C^y``, train vs test.
+
+    Two panels (PC, backprop). ``alignment_df`` must have columns
+    ``layer``, ``method``, ``split`` (``train`` / ``test``), and
+    ``alignment``. The target kernel is ``C^y = Y Y^T`` of that split.
+    """
+    if alignment_df is None or len(alignment_df) == 0:
+        print("No train/test kernel-target alignment records to plot.")
+        return None
+
+    out_dir = _alignment_plots_dir(
+        plots_dir,
+        n_hidden=n_hidden,
+        gamma_0=gamma_0,
+        activity_lr=activity_lr,
+        n_infer_iters=n_infer_iters,
+        dir_name=dir_name,
+    )
+    sym = _feature_kernel_tex(feature_symbol)
+    plot_df = alignment_df.copy()
+    plot_df["layer_display"] = plot_df["layer"].astype(int) + 1
+    _warn_if_nonfinite(
+        "train/test kernel-target alignment",
+        np.asarray(plot_df["alignment"], dtype=float),
+    )
+    ylim = _data_ylim(plot_df["alignment"], invert=False, ymin_floor=0.0)
+    layers = sorted(plot_df["layer_display"].unique())
+    if ylabel is None:
+        ylabel = rf"$\mathrm{{CKA}}(C^{{{sym},\ell}}, C^{{y}})$"
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(11.0, 3.6), sharex=True, sharey=True
+    )
+    for ax, method, panel in zip(
+        axes, ("pc", "bp"), ("PC", "Backprop")
+    ):
+        sub = plot_df[plot_df["method"] == method]
+        _plot_train_test_series(
+            ax,
+            sub,
+            x_col="layer_display",
+            value_col="alignment",
+            markersize=8,
+            label_prefix=f"target alignment ({method}) ",
+        )
+        ax.set_xticks(layers)
+        ax.set_xlabel(r"layer $\ell$")
+        ax.set_title(panel)
+        _maybe_set_ylim(ax, ylim)
+        ax.grid(True, alpha=0.4)
+    axes[0].set_ylabel(ylabel)
+    axes[0].legend(fontsize=8)
+    if title is None:
+        title = "Feature-kernel alignment with the target (train vs test)"
+    fig.suptitle(
+        title
+        + _fig_param_suffix(
+            n_hidden=n_hidden,
+            width=width,
+            gamma_0=gamma_0,
+            activity_lr=activity_lr,
+        ),
+        y=1.02,
+    )
+    fig.tight_layout()
+    save_path = os.path.join(out_dir, filename)
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Train/test kernel-target alignment saved to {save_path}")
     return save_path
 
 

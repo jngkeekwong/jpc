@@ -142,6 +142,9 @@ def _train_finite_pc(
     collect_fields=True,
     collect_h_k0=False,
     collect_init_model=False,
+    X_eval=None,
+    phi_fn=None,
+    collect_eval_kernels=False,
 ):
     """Run one finite-width PC training job.
 
@@ -153,6 +156,10 @@ def _train_finite_pc(
     training step, shape ``(n_hidden, T, P, N)``. When
     ``collect_init_model`` is True, ``fields["init_model"]`` is the
     untrained ``jpc.make_mlp`` layer list (weights before any update).
+    ``X_eval`` / ``collect_eval_kernels`` record feedforward feature
+    kernels on a held-out batch as ``fields["eval_kernels"]`` (a list
+    of per-layer kernels, one list per training step). Requires
+    ``phi_fn``.
     """
     save_dir = setup_pc_experiment(
         results_dir=results_dir,
@@ -205,6 +212,22 @@ def _train_finite_pc(
             [np.asarray(h, dtype=np.float32) for h in hs_init], axis=0
         )
     h_k0_steps = [] if collect_h_k0 else None
+    eval_kernels = [] if collect_eval_kernels else None
+    if collect_eval_kernels:
+        if X_eval is None or phi_fn is None:
+            raise ValueError(
+                "collect_eval_kernels requires X_eval and phi_fn"
+            )
+
+        def _record_eval_kernels(hs):
+            h = np.stack(
+                [np.asarray(x, dtype=np.float32) for x in hs], axis=0
+            )
+            eval_kernels.append(_feature_kernels_from_h(h, phi_fn))
+
+        h_k0_eval_callback = _record_eval_kernels
+    else:
+        h_k0_eval_callback = None
     init_model = jax.tree.map(
         lambda x: jnp.array(x) if eqx.is_array(x) else x, model
     )
@@ -226,9 +249,16 @@ def _train_finite_pc(
         store_grads=False,
         loss_id=loss_id,
         h_k0_steps=h_k0_steps,
+        X_eval=X_eval,
+        h_k0_eval_callback=h_k0_eval_callback,
     )
     losses = np.load(f"{save_dir}/train_losses.npy")
-    if not collect_fields and not collect_h_k0 and not collect_init_model:
+    if (
+        not collect_fields
+        and not collect_h_k0
+        and not collect_init_model
+        and not collect_eval_kernels
+    ):
         return losses, None
     fields = {}
     if collect_fields:
@@ -247,6 +277,8 @@ def _train_finite_pc(
         fields["h_init"] = h_init
     if collect_h_k0:
         fields["h_k0_traj"] = np.stack(h_k0_steps, axis=1)
+    if collect_eval_kernels:
+        fields["eval_kernels"] = eval_kernels
     if collect_init_model:
         fields["init_model"] = init_model
     return losses, fields
