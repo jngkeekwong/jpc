@@ -1400,9 +1400,8 @@ def plot_pc_bp_alignment_vs_time(
 
     ``feature_symbol`` is ``"h"`` (linear) or ``"phi"`` (nonlinear).
     Pass ``ylabel`` / ``filename`` / ``title`` / ``ylim`` to reuse this
-    figure for kernel-*change* centered cosine similarity
-    (``C(t) - C(0)``; not CKA, since difference kernels need not be
-    PSD). ``ylim`` defaults to a tight pad around the plotted values.
+    figure for kernel-*change* CKA (``C(t) - C(0)``). ``ylim`` defaults
+    to a tight pad around the plotted values.
     """
     if alignment_df is None or len(alignment_df) == 0:
         print("No PC-BP kernel alignment records to plot.")
@@ -1965,6 +1964,72 @@ def plot_pc_bp_kernel_alignment(
     return save_path
 
 
+def _kernel_cbar_label(cbar_label, vmin, vmax):
+    if cbar_label is not None:
+        return cbar_label
+    if (
+        vmin is not None
+        and vmax is not None
+        and np.isclose(vmin, -1.0)
+        and np.isclose(vmax, 1.0)
+    ):
+        return "correlation"
+    return None
+
+
+def _style_kernel_heatmap_ax(
+    ax,
+    *,
+    xlabel=None,
+    ylabel=None,
+    row_label=None,
+    mark_origin=False,
+):
+    """Hide ticks and optionally place axis symbols flush against the heatmap."""
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.tick_params(
+        axis="both",
+        which="both",
+        length=0,
+        pad=0,
+        bottom=False,
+        left=False,
+        top=False,
+        right=False,
+        labelbottom=False,
+        labelleft=False,
+    )
+    if xlabel is not None:
+        ax.set_xlabel(xlabel, labelpad=1, fontsize=11)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel, labelpad=1, fontsize=11)
+    if mark_origin:
+        ax.annotate(
+            "0",
+            xy=(0.0, 0.0),
+            xycoords="axes fraction",
+            xytext=(-1, -1),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+            fontsize=8,
+            annotation_clip=False,
+        )
+    if row_label is not None:
+        ax.annotate(
+            row_label,
+            xy=(0, 0.5),
+            xycoords="axes fraction",
+            xytext=(-36, 0),
+            textcoords="offset points",
+            ha="right",
+            va="center",
+            rotation=90,
+            fontsize=11,
+        )
+
+
 def plot_final_kernel_grid(
     kernel_rows,
     plots_dir,
@@ -1980,16 +2045,28 @@ def plot_final_kernel_grid(
     title="Final feature kernels",
     dir_name="alignment",
     origin="upper",
+    xlabel=r"$\mu$",
+    ylabel=r"$\nu$",
+    cbar_label=None,
+    mark_origin=False,
 ):
     """Grid of feature kernels (one heatmap per layer).
 
-    ``kernel_rows`` is a list of ``(ylabel, kernels)`` pairs. Each
+    ``kernel_rows`` is a list of ``(row_label, kernels)`` pairs. Each
     ``kernels`` is a sequence of 2-D arrays, one per layer (column),
     typically ``P x P`` (sample-sample) or ``T x T`` (sample-traced).
     When ``share_clim`` is True, every panel uses the same colour limits.
     Explicit ``vmin`` / ``vmax`` override ``share_clim``. ``origin`` is
     forwarded to ``imshow`` (``"upper"`` puts index ``0`` at the
     top-left; ``"lower"`` puts it at the bottom-left).
+
+    Tick marks are omitted. Axis symbols are drawn only on the outer
+    panels: ``xlabel`` on the bottom row and ``ylabel`` on the left
+    column (sample kernels default to ``$\\mu$`` / ``$\\nu$``).
+    ``mark_origin`` draws a ``0`` at the bottom-left of the grid. A
+    colour bar is drawn on the right (shared when colour limits are
+    shared, otherwise one per panel). ``vmin=vmax=±1`` defaults
+    ``cbar_label`` to ``"correlation"``.
     """
     if not kernel_rows:
         raise ValueError("kernel_rows must contain at least one row.")
@@ -2025,22 +2102,54 @@ def plot_final_kernel_grid(
         if finite.size:
             clim_kw = dict(vmin=float(finite.min()), vmax=float(finite.max()))
 
+    cbar_label = _kernel_cbar_label(cbar_label, vmin, vmax)
+    share_cbar = bool(clim_kw)
     n_rows = len(rows)
     fig, axes = plt.subplots(
-        n_rows, n_layers, figsize=(2 * n_layers, 2 * n_rows), squeeze=False
+        n_rows,
+        n_layers,
+        figsize=(2.5 * n_layers + 0.9, 2.4 * n_rows + 0.3),
+        squeeze=False,
+        constrained_layout=True,
     )
+    images = []
     for r, (label, kernels) in enumerate(rows):
         for l, kernel in enumerate(kernels):
             ax = axes[r, l]
-            ax.imshow(
-                np.asarray(kernel), cmap="coolwarm", origin=origin, **clim_kw
+            arr = np.asarray(kernel)
+            im = ax.imshow(
+                arr, cmap="coolwarm", origin=origin, aspect="equal", **clim_kw
             )
-            ax.set_xticks([])
-            ax.set_yticks([])
+            ax.set_box_aspect(1)
+            images.append(im)
             if r == 0:
                 ax.set_title(rf"$\ell = {l + 1}$")
-            if l == 0:
-                ax.set_ylabel(label)
+            _style_kernel_heatmap_ax(
+                ax,
+                xlabel=xlabel if r == n_rows - 1 else None,
+                ylabel=ylabel if l == 0 else None,
+                row_label=label if l == 0 else None,
+                mark_origin=(
+                    mark_origin and r == n_rows - 1 and l == 0
+                ),
+            )
+
+    if images:
+        if share_cbar:
+            cbar = fig.colorbar(images[0], ax=axes, fraction=0.035, pad=0.02)
+            if cbar_label:
+                cbar.set_label(cbar_label)
+        else:
+            for r in range(n_rows):
+                for l in range(n_layers):
+                    cbar = fig.colorbar(
+                        images[r * n_layers + l],
+                        ax=axes[r, l],
+                        fraction=0.046,
+                        pad=0.04,
+                    )
+                    if cbar_label:
+                        cbar.set_label(cbar_label)
 
     fig_title = title
     if n_hidden is not None:
@@ -2053,8 +2162,7 @@ def plot_final_kernel_grid(
         fig_title += f", activity lr$={activity_lr}$"
     if n_infer_iters is not None:
         fig_title += f", $K={int(n_infer_iters)}$"
-    fig.suptitle(fig_title, y=1.02)
-    fig.tight_layout()
+    fig.suptitle(fig_title)
 
     out_dir = _alignment_plots_dir(
         plots_dir,
@@ -2086,11 +2194,16 @@ def plot_temporal_kernel_grid(
     dir_name="alignment",
     origin="lower",
     title="Sample-traced feature kernels",
+    xlabel=r"$t$",
+    ylabel=r"$t'$",
+    cbar_label=None,
+    mark_origin=True,
 ):
     """Grid of sample-traced (``T x T``) feature kernels at ``k=0``.
 
     ``origin="lower"`` (default) places index ``0`` at the bottom-left
     of each heatmap, i.e. the time axes increase upward/rightward.
+    Axis symbols sit on the outer panels; a ``0`` marks the origin.
     """
     return plot_final_kernel_grid(
         kernel_rows,
@@ -2107,6 +2220,10 @@ def plot_temporal_kernel_grid(
         title=title,
         dir_name=dir_name,
         origin=origin,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        cbar_label=cbar_label,
+        mark_origin=mark_origin,
     )
 
 

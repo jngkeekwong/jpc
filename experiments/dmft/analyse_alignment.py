@@ -32,9 +32,8 @@ and alignment line plots use a denser time grid: every training step if
   (CKA) between the PC and backprop feature kernels at each layer,
   x-axis is training time ``t``, one curve per layer
   (``alignment/pc_bp_kernel_alignment_vs_time.png``), plus a matching
-  figure of *centered cosine similarity* between the kernel *changes*
-  ``C(t) - C(0)`` (not CKA: difference kernels need not be PSD),
-  omitting ``t=0`` (``alignment/pc_bp_kernel_change_cosine_vs_time.png``).
+  figure of CKA between the kernel *changes* ``C(t) - C(0)``, omitting
+  ``t=0`` (``alignment/pc_bp_kernel_change_alignment_vs_time.png``).
 - Sample-traced temporal kernels: a single figure using the same grid
   scheme as the feature-kernel grid (top row PC / bottom row backprop,
   one column per layer), but with ``T x T`` kernels traced over samples
@@ -631,15 +630,13 @@ if __name__ == "__main__":
         plot_pc_bp_alignment_vs_time(
             pd.DataFrame(change_alignment_records),
             ylabel=(
-                rf"$\cos(\widetilde{{\Delta C}}^{{{feat_tex},\ell}}"
+                rf"$\mathrm{{CKA}}(\Delta C^{{{feat_tex},\ell}}"
                 rf"_{{\mathrm{{PC}}}}(t), "
-                rf"\widetilde{{\Delta C}}^{{{feat_tex},\ell}}"
-                rf"_{{\mathrm{{BP}}}}(t))$"
+                rf"\Delta C^{{{feat_tex},\ell}}_{{\mathrm{{BP}}}}(t))$"
             ),
-            filename="pc_bp_kernel_change_cosine_vs_time.png",
+            filename="pc_bp_kernel_change_alignment_vs_time.png",
             title=(
-                "PC vs backprop kernel-change alignment "
-                "(centered cosine)"
+                "PC vs backprop feature-kernel change alignment over training"
             ),
             **plot_kw,
         )
@@ -727,9 +724,16 @@ if __name__ == "__main__":
 # Closed-form inference for PC
 # CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 20 --n_hidden 5 --width 10000 --gamma_0 1.0 --param_lr 0.1 --param_lr_pc 0.2 --pc_infer_mode closed_form --n_train_iters 21
 
+# Closed-form inference for PC (tiny-CIFAR10)
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 40 --n_hidden 3 --width 10000 --gamma_0 1.0 --param_lr 0.05 --param_lr_pc 0.5 --pc_infer_mode closed_form --n_train_iters 501 --dataset tiny-CIFAR10
+
 
 ############ NONLINEAR ##################
 #########################################
 
 # Infer mode (default)
-# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 10 --n_hidden 3 --width 10000 --gamma_0 1.0 --param_lr 0.5 --param_lr_pc 1.0 --activity_lr 0.05 --pc_infer_mode infer --n_infer_iters 100 --n_train_iters 31 --act_fn tanh --dataset tiny-CIFAR10
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 40 --n_hidden 3 --width 10000 --gamma_0 1.0 --param_lr 0.5 --param_lr_pc 1.0 --activity_lr 0.05 --pc_infer_mode infer --n_infer_iters 100 --n_train_iters 31 --act_fn tanh --dataset tiny-CIFAR10
+
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 40 --n_hidden 3 --width 10000 --gamma_0 1.0 --param_lr 0.2 --param_lr_pc 0.5 --activity_lr 0.1 --pc_infer_mode infer --n_infer_iters 200 --n_train_iters 101 --act_fn tanh --dataset tiny-CIFAR10
+
+# CUDA_VISIBLE_DEVICES=1 python analyse_alignment.py --n_samples 40 --n_hidden 3 --width 10000 --gamma_0 1.0 --param_lr 0.05 --param_lr_pc 0.5 --activity_lr 0.1 --pc_infer_mode infer --n_infer_iters 200 --n_train_iters 801 --act_fn tanh --dataset tiny-CIFAR10
