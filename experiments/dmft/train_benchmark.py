@@ -4,15 +4,26 @@ Trains a predictive-coding network and a backprop network on the **same**
 minibatches (augment once, then both update) for ``--n_epochs`` passes over
 the training set, then overlays train/test loss and accuracy.
 
+If any of ``--n_hidden``, ``--width``, ``--batch_size``, ``--n_res_blocks``,
+``--param_lr``, ``--param_lr_pc``, ``--activity_lr``, or ``--n_infer_iters``
+is given as a list, runs a Cartesian hyperparameter sweep. Backprop and PC
+are trained separately: shared architecture/batch axes apply to both,
+``--param_lr`` is BP-only, and ``--param_lr_pc`` / ``--activity_lr`` /
+``--n_infer_iters`` are PC-only. Configs are ranked by mean final test
+accuracy across ``--n_seeds``. Sweep runs are stored under
+``hp_sweep/{bp|pc}/key=value/.../seed=N`` with a compact
+``sweep_summary.json``.
+
 Energy scalings match ``train.py`` / ``train_pcn``:
 
     λ = γ² N L    (µPC output precision)
     κ = L         (µPC hidden precision)
 
 For Adam, the PC parameter LR is divided the same way as BP
-(``1/√N``, or ``1/√(N L)`` with MLP skips). GD keeps the ``train.py``
-convention: PC uses the raw ``--param_lr_pc`` (scale lives in the energy);
-BP bakes ``γ² N`` into the optimiser.
+(``1/√N``, or ``1/√(N L)`` with MLP skips). GD and SGD+momentum keep the
+``train.py`` convention: PC uses the raw ``--param_lr_pc`` (scale lives
+in the energy); BP bakes ``γ² N`` into the optimiser. No Adam-style
+``1/√N`` rescaling is applied for SGD+momentum.
 
 CNN residual blocks still use the per-parameter Adam tree from
 ``configure_cnn_param_optim``. ImageNet is streamed from Hugging Face.
@@ -27,6 +38,8 @@ import argparse
 import json
 import os
 import sys
+import time
+from itertools import product
 from pathlib import Path
 
 import matplotlib
@@ -138,6 +151,20 @@ def mlp_adam_lr(param_lr, param_type, use_skips, width, depth):
     if use_skips:
         return param_lr / (np.sqrt(width) * np.sqrt(depth))
     return param_lr / np.sqrt(width)
+
+
+def bp_gd_style_lr(args):
+    """BP GD / SGD+momentum LR: µP bakes ``γ² N`` into the optimiser."""
+    if args.param_type == "sp":
+        return args.param_lr
+    return args.param_lr * (args.gamma ** 2) * args.width
+
+
+def make_sgd_param_optim(learning_rate, args):
+    """Vanilla GD or SGD+momentum. No Adam-style ``1/√N`` rescaling."""
+    if args.param_optim == "sgd_momentum":
+        return optax.sgd(learning_rate, momentum=args.momentum)
+    return optax.sgd(learning_rate)
 
 
 def supervised_loss(preds, y, loss_id):
@@ -353,6 +380,27 @@ def iter_train_batches(args, epoch):
     return _iter_prepared(raw, args.arch)
 
 
+def iter_eval_train_batches(args):
+    """Training-set batches for eval; does not consume the shuffled train loader."""
+    if args.dataset == "ImageNet":
+        raw = iter_imagenet_hf(
+            split="train",
+            batch_size=args.batch_size,
+            seed=args.seed,
+            n_examples=IMAGENET_TRAIN_SIZE,
+            train=True,
+            drop_last=False,
+        )
+    else:
+        raw = DataLoader(
+            args._train_loader.dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+    return _iter_prepared(raw, args.arch)
+
+
 def iter_test_batches(args):
     if args.dataset == "ImageNet":
         raw = iter_imagenet_hf(
@@ -439,9 +487,9 @@ def pc_jpc_kwargs(args):
 
 def make_pc_param_optim(pc_model, skip_model, args, depth):
     if args.arch == "cnn":
-        if args.param_optim == "gd":
+        if args.param_optim in ("gd", "sgd_momentum"):
             # train.py PC GD: raw LR; width/gamma/depth live in the energy.
-            param_optim = optax.sgd(args.param_lr_pc)
+            param_optim = make_sgd_param_optim(args.param_lr_pc, args)
         else:
             param_optim = configure_cnn_param_optim(
                 pc_model,
@@ -458,8 +506,8 @@ def make_pc_param_optim(pc_model, skip_model, args, depth):
         )
         return param_optim, opt_state
 
-    if args.param_optim == "gd":
-        param_optim = optax.sgd(args.param_lr_pc)
+    if args.param_optim in ("gd", "sgd_momentum"):
+        param_optim = make_sgd_param_optim(args.param_lr_pc, args)
     elif args.param_optim == "adam":
         param_optim = optax.adam(
             mlp_adam_lr(
@@ -479,6 +527,10 @@ def make_pc_param_optim(pc_model, skip_model, args, depth):
 
 
 def make_bp_param_optim(bp_model, args, depth):
+    if args.param_optim == "sgd_momentum":
+        optim = make_sgd_param_optim(bp_gd_style_lr(args), args)
+        return optim, optim.init(eqx.filter(bp_model, eqx.is_array))
+
     if args.arch == "cnn":
         optim = configure_cnn_param_optim(
             bp_model,
@@ -524,32 +576,96 @@ def bp_batch_metrics(model, x, y, loss_id):
     return float(supervised_loss(preds, y, loss_id)), float(accuracy_pct(preds, y))
 
 
-def evaluate_pc(model, args, skip_model, jpc_kw):
-    total_loss, total_acc, n_seen = 0.0, 0.0, 0
-    for x, y in iter_test_batches(args):
-        b = int(x.shape[0])
-        loss, acc = pc_batch_metrics(
-            model, x, y, skip_model, jpc_kw, args.loss_id
-        )
-        total_loss += loss * b
-        total_acc += acc * b
-        n_seen += b
-    if n_seen == 0:
-        return float("nan"), float("nan")
-    return total_loss / n_seen, total_acc / n_seen
+def n_train_batches(args):
+    if args.dataset == "ImageNet":
+        return IMAGENET_TRAIN_SIZE // args.batch_size
+    return len(args._train_loader)
 
 
-def evaluate_bp(model, args):
-    total_loss, total_acc, n_seen = 0.0, 0.0, 0
-    for x, y in iter_test_batches(args):
+def mini_epoch_boundaries(n_batches, n_mini):
+    """Batch indices (1-based) at which a mini-epoch ends, including the last."""
+    n_mini = max(1, min(int(n_mini), int(n_batches)))
+    bounds = []
+    for i in range(n_mini):
+        bound = int(round((i + 1) * n_batches / n_mini))
+        bound = min(max(bound, 1), n_batches)
+        if not bounds or bound > bounds[-1]:
+            bounds.append(bound)
+    if bounds[-1] != n_batches:
+        bounds[-1] = n_batches
+    return set(bounds)
+
+
+def _evaluate_batches(
+    batches,
+    args,
+    *,
+    bp_model=None,
+    pc_model=None,
+    skip_model=None,
+    jpc_kw=None,
+):
+    """Size-weighted feedforward loss/acc over ``batches`` (no updates)."""
+    skip_pc = pc_model is None
+    skip_bp = bp_model is None
+    pc_loss_sum = pc_acc_sum = 0.0
+    bp_loss_sum = bp_acc_sum = 0.0
+    n_seen = 0
+    for x, y in batches:
         b = int(x.shape[0])
-        loss, acc = bp_batch_metrics(model, x, y, args.loss_id)
-        total_loss += loss * b
-        total_acc += acc * b
+        if not skip_bp:
+            bp_loss, bp_acc = bp_batch_metrics(bp_model, x, y, args.loss_id)
+            bp_loss_sum += bp_loss * b
+            bp_acc_sum += bp_acc * b
+        if not skip_pc:
+            pc_loss, pc_acc = pc_batch_metrics(
+                pc_model, x, y, skip_model, jpc_kw, args.loss_id
+            )
+            pc_loss_sum += pc_loss * b
+            pc_acc_sum += pc_acc * b
         n_seen += b
+    empty = (float("nan"), float("nan"))
     if n_seen == 0:
-        return float("nan"), float("nan")
-    return total_loss / n_seen, total_acc / n_seen
+        return empty, empty
+    pc_metrics = (
+        empty if skip_pc else (pc_loss_sum / n_seen, pc_acc_sum / n_seen)
+    )
+    bp_metrics = (
+        empty if skip_bp else (bp_loss_sum / n_seen, bp_acc_sum / n_seen)
+    )
+    return pc_metrics, bp_metrics
+
+
+def evaluate_pc(model, args, skip_model, jpc_kw, batches=None):
+    if batches is None:
+        batches = iter_test_batches(args)
+    pc_metrics, _ = _evaluate_batches(
+        batches,
+        args,
+        pc_model=model,
+        skip_model=skip_model,
+        jpc_kw=jpc_kw,
+    )
+    return pc_metrics
+
+
+def evaluate_bp(model, args, batches=None):
+    if batches is None:
+        batches = iter_test_batches(args)
+    _, bp_metrics = _evaluate_batches(batches, args, bp_model=model)
+    return bp_metrics
+
+
+def evaluate_train(bp_model, args, *, pc_model=None, skip_model=None, jpc_kw=None):
+    """Training-set feedforward metrics at the current parameters."""
+    return _evaluate_batches(
+        iter_eval_train_batches(args),
+        args,
+        bp_model=bp_model,
+        pc_model=pc_model,
+        skip_model=skip_model,
+        jpc_kw=jpc_kw,
+    )
 
 
 def pc_infer_and_update(
@@ -655,6 +771,11 @@ def setup_save_dir(args, seed_tag=None):
         f"{args.param_type}_param_type",
         f"{args.gamma}_gamma",
         f"{args.param_optim}_param_optim",
+        *(
+            [f"{args.momentum}_momentum"]
+            if args.param_optim == "sgd_momentum"
+            else []
+        ),
         f"{args.param_lr}_param_lr",
         f"{args.param_lr_pc}_param_lr_pc",
         f"{args.batch_size}_batch_size",
@@ -663,6 +784,7 @@ def setup_save_dir(args, seed_tag=None):
         f"{args.activity_lr}_activity_lr",
         f"{args.use_skips}_use_skips",
         f"{args.skip_pc}_skip_pc",
+        f"{getattr(args, 'skip_bp', False)}_skip_bp",
         seed_tag,
     )
 
@@ -692,6 +814,7 @@ def _plot_overlay(
     yerr_pc=None,
     yerr_bp=None,
     skip_pc=False,
+    skip_bp=False,
 ):
     if not skip_pc:
         ax.plot(
@@ -706,30 +829,51 @@ def _plot_overlay(
                 alpha=0.2,
                 linewidth=0,
             )
-    ax.plot(
-        xs_bp, ys_bp, marker="s", color="tab:orange", label="Backprop", alpha=0.9
-    )
-    if yerr_bp is not None:
-        ax.fill_between(
-            xs_bp,
-            np.asarray(ys_bp) - np.asarray(yerr_bp),
-            np.asarray(ys_bp) + np.asarray(yerr_bp),
-            color="tab:orange",
-            alpha=0.2,
-            linewidth=0,
+    if not skip_bp:
+        ax.plot(
+            xs_bp, ys_bp, marker="s", color="tab:orange", label="Backprop", alpha=0.9
         )
+        if yerr_bp is not None:
+            ax.fill_between(
+                xs_bp,
+                np.asarray(ys_bp) - np.asarray(yerr_bp),
+                np.asarray(ys_bp) + np.asarray(yerr_bp),
+                color="tab:orange",
+                alpha=0.2,
+                linewidth=0,
+            )
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.4)
     ax.legend(fontsize=8)
 
 
-def _metrics_title(skip_pc, *, mean_sem=False, n_seeds=None, per_step=False):
+def _metric_plot_stem(skip_pc, skip_bp=False):
+    if skip_pc:
+        return "bp"
+    if skip_bp:
+        return "pc"
+    return "pc_bp"
+
+
+def _metrics_title(
+    skip_pc,
+    *,
+    skip_bp=False,
+    mean_sem=False,
+    n_seeds=None,
+    per_step=False,
+    per_mini=False,
+):
     if skip_pc:
         base = "Backprop"
+    elif skip_bp:
+        base = "Predictive coding"
     else:
         base = "PC vs backprop"
-    if per_step:
+    if per_mini:
+        base = f"{base} (mini-epoch)"
+    elif per_step:
         base = f"{base} (per step)"
     if mean_sem:
         base = f"{base} (mean ± SEM, n={n_seeds} seeds)"
@@ -737,10 +881,16 @@ def _metrics_title(skip_pc, *, mean_sem=False, n_seeds=None, per_step=False):
 
 
 def plot_metrics(
-    history, save_dir, title_suffix="", log_steps=False, skip_pc=False
+    history,
+    save_dir,
+    title_suffix="",
+    log_steps=False,
+    skip_pc=False,
+    skip_bp=False,
 ):
     os.makedirs(save_dir, exist_ok=True)
-    plot_kw = dict(skip_pc=skip_pc)
+    plot_kw = dict(skip_pc=skip_pc, skip_bp=skip_bp)
+    stem = _metric_plot_stem(skip_pc, skip_bp)
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
     _plot_overlay(
@@ -783,17 +933,66 @@ def plot_metrics(
         "Test accuracy (%)",
         **plot_kw,
     )
-    fig.suptitle(_metrics_title(skip_pc) + title_suffix)
+    fig.suptitle(_metrics_title(skip_pc, skip_bp=skip_bp) + title_suffix)
     fig.tight_layout()
-    epoch_name = (
-        "bp_epoch_metrics.png" if skip_pc else "pc_bp_epoch_metrics.png"
-    )
+    epoch_name = f"{stem}_epoch_metrics.png"
     epoch_path = os.path.join(save_dir, epoch_name)
     fig.savefig(epoch_path, bbox_inches="tight")
     plt.close(fig)
 
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    _plot_overlay(
+        axes[0, 0],
+        history["mini_epoch"],
+        history["pc_train_loss_mini"],
+        history["mini_epoch"],
+        history["bp_train_loss_mini"],
+        "Epoch",
+        "Train loss",
+        **plot_kw,
+    )
+    _plot_overlay(
+        axes[0, 1],
+        history["mini_epoch"],
+        history["pc_test_loss_mini"],
+        history["mini_epoch"],
+        history["bp_test_loss_mini"],
+        "Epoch",
+        "Test loss",
+        **plot_kw,
+    )
+    _plot_overlay(
+        axes[1, 0],
+        history["mini_epoch"],
+        history["pc_train_acc_mini"],
+        history["mini_epoch"],
+        history["bp_train_acc_mini"],
+        "Epoch",
+        "Train accuracy (%)",
+        **plot_kw,
+    )
+    _plot_overlay(
+        axes[1, 1],
+        history["mini_epoch"],
+        history["pc_test_acc_mini"],
+        history["mini_epoch"],
+        history["bp_test_acc_mini"],
+        "Epoch",
+        "Test accuracy (%)",
+        **plot_kw,
+    )
+    fig.suptitle(
+        _metrics_title(skip_pc, skip_bp=skip_bp, per_mini=True) + title_suffix
+    )
+    fig.tight_layout()
+    mini_name = f"{stem}_mini_epoch_metrics.png"
+    mini_path = os.path.join(save_dir, mini_name)
+    fig.savefig(mini_path, bbox_inches="tight")
+    plt.close(fig)
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    steps = np.arange(len(history["bp_train_loss_step"]))
+    step_key = "pc_train_loss_step" if skip_bp else "bp_train_loss_step"
+    steps = np.arange(len(history[step_key]))
     _plot_overlay(
         axes[0],
         steps,
@@ -814,26 +1013,44 @@ def plot_metrics(
         "Train accuracy (%)",
         **plot_kw,
     )
-    fig.suptitle(_metrics_title(skip_pc, per_step=True) + title_suffix)
-    fig.tight_layout()
-    step_name = (
-        "bp_step_metrics.png" if skip_pc else "pc_bp_step_metrics.png"
+    fig.suptitle(
+        _metrics_title(skip_pc, skip_bp=skip_bp, per_step=True) + title_suffix
     )
+    fig.tight_layout()
+    step_name = f"{stem}_step_metrics.png"
     step_path = os.path.join(save_dir, step_name)
     fig.savefig(step_path, bbox_inches="tight")
     plt.close(fig)
     if log_steps:
-        print(f"Saved plots to {epoch_path} and {step_path}")
-    return epoch_path, step_path
+        print(f"Saved plots to {epoch_path}, {mini_path}, and {step_path}")
+    return epoch_path, mini_path, step_path
+
+
+def _mean_sem_method_curves(histories, pc_key, bp_key, skip_pc, skip_bp):
+    """Mean ± SEM for PC and/or BP curves, matching which method was trained."""
+    if skip_bp:
+        mean_pc, sem_pc, n_t = _aggregate_curves([h[pc_key] for h in histories])
+        return mean_pc, sem_pc, mean_pc, None, n_t
+    mean_bp, sem_bp, n_t = _aggregate_curves([h[bp_key] for h in histories])
+    if skip_pc:
+        return mean_bp, None, mean_bp, sem_bp, n_t
+    mean_pc, sem_pc, n_t = _aggregate_curves([h[pc_key] for h in histories])
+    return mean_pc, sem_pc, mean_bp, sem_bp, n_t
 
 
 def plot_metrics_mean_sem(
-    histories, save_dir, title_suffix="", log_steps=False, skip_pc=False
+    histories,
+    save_dir,
+    title_suffix="",
+    log_steps=False,
+    skip_pc=False,
+    skip_bp=False,
 ):
     """Plot mean ± SEM across seeds (shaded bands)."""
     os.makedirs(save_dir, exist_ok=True)
     n_seeds = len(histories)
-    plot_kw = dict(skip_pc=skip_pc)
+    plot_kw = dict(skip_pc=skip_pc, skip_bp=skip_bp)
+    stem = _metric_plot_stem(skip_pc, skip_bp)
 
     epoch_train = np.asarray(histories[0]["epoch_train"])
     epoch_eval = np.asarray(histories[0]["epoch_eval"])
@@ -855,13 +1072,9 @@ def plot_metrics_mean_sem(
     for ax, (pc_key, bp_key, xs, xlabel, ylabel) in zip(
         axes.ravel(), metric_pairs
     ):
-        mean_bp, sem_bp, n_t = _aggregate_curves([h[bp_key] for h in histories])
-        if skip_pc:
-            mean_pc, sem_pc = mean_bp, None
-        else:
-            mean_pc, sem_pc, n_t = _aggregate_curves(
-                [h[pc_key] for h in histories]
-            )
+        mean_pc, sem_pc, mean_bp, sem_bp, n_t = _mean_sem_method_curves(
+            histories, pc_key, bp_key, skip_pc, skip_bp
+        )
         xs_use = np.asarray(xs)[:n_t]
         _plot_overlay(
             ax,
@@ -876,16 +1089,64 @@ def plot_metrics_mean_sem(
             **plot_kw,
         )
     fig.suptitle(
-        _metrics_title(skip_pc, mean_sem=True, n_seeds=n_seeds) + title_suffix
+        _metrics_title(
+            skip_pc, skip_bp=skip_bp, mean_sem=True, n_seeds=n_seeds
+        )
+        + title_suffix
     )
     fig.tight_layout()
-    epoch_name = (
-        "bp_epoch_metrics_mean_sem.png"
-        if skip_pc
-        else "pc_bp_epoch_metrics_mean_sem.png"
-    )
+    epoch_name = f"{stem}_epoch_metrics_mean_sem.png"
     epoch_path = os.path.join(save_dir, epoch_name)
     fig.savefig(epoch_path, bbox_inches="tight")
+    plt.close(fig)
+
+    mini_epoch = np.asarray(histories[0]["mini_epoch"])
+    mini_pairs = [
+        ("pc_train_loss_mini", "bp_train_loss_mini", mini_epoch, "Epoch", "Train loss"),
+        ("pc_test_loss_mini", "bp_test_loss_mini", mini_epoch, "Epoch", "Test loss"),
+        (
+            "pc_train_acc_mini",
+            "bp_train_acc_mini",
+            mini_epoch,
+            "Epoch",
+            "Train accuracy (%)",
+        ),
+        ("pc_test_acc_mini", "bp_test_acc_mini", mini_epoch, "Epoch", "Test accuracy (%)"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    for ax, (pc_key, bp_key, xs, xlabel, ylabel) in zip(
+        axes.ravel(), mini_pairs
+    ):
+        mean_pc, sem_pc, mean_bp, sem_bp, n_t = _mean_sem_method_curves(
+            histories, pc_key, bp_key, skip_pc, skip_bp
+        )
+        xs_use = np.asarray(xs)[:n_t]
+        _plot_overlay(
+            ax,
+            xs_use,
+            mean_pc,
+            xs_use,
+            mean_bp,
+            xlabel,
+            ylabel,
+            yerr_pc=sem_pc,
+            yerr_bp=sem_bp,
+            **plot_kw,
+        )
+    fig.suptitle(
+        _metrics_title(
+            skip_pc,
+            skip_bp=skip_bp,
+            mean_sem=True,
+            n_seeds=n_seeds,
+            per_mini=True,
+        )
+        + title_suffix
+    )
+    fig.tight_layout()
+    mini_name = f"{stem}_mini_epoch_metrics_mean_sem.png"
+    mini_path = os.path.join(save_dir, mini_name)
+    fig.savefig(mini_path, bbox_inches="tight")
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -894,13 +1155,9 @@ def plot_metrics_mean_sem(
         ("pc_train_acc_step", "bp_train_acc_step", "Train accuracy (%)"),
     ]
     for ax, (pc_key, bp_key, ylabel) in zip(axes, step_pairs):
-        mean_bp, sem_bp, n_t = _aggregate_curves([h[bp_key] for h in histories])
-        if skip_pc:
-            mean_pc, sem_pc = mean_bp, None
-        else:
-            mean_pc, sem_pc, n_t = _aggregate_curves(
-                [h[pc_key] for h in histories]
-            )
+        mean_pc, sem_pc, mean_bp, sem_bp, n_t = _mean_sem_method_curves(
+            histories, pc_key, bp_key, skip_pc, skip_bp
+        )
         steps = np.arange(n_t)
         _plot_overlay(
             ax,
@@ -915,23 +1172,27 @@ def plot_metrics_mean_sem(
             **plot_kw,
         )
     fig.suptitle(
-        _metrics_title(skip_pc, mean_sem=True, n_seeds=n_seeds, per_step=True)
+        _metrics_title(
+            skip_pc,
+            skip_bp=skip_bp,
+            mean_sem=True,
+            n_seeds=n_seeds,
+            per_step=True,
+        )
         + title_suffix
     )
     fig.tight_layout()
-    step_name = (
-        "bp_step_metrics_mean_sem.png"
-        if skip_pc
-        else "pc_bp_step_metrics_mean_sem.png"
-    )
+    step_name = f"{stem}_step_metrics_mean_sem.png"
     step_path = os.path.join(save_dir, step_name)
     fig.savefig(step_path, bbox_inches="tight")
     plt.close(fig)
     if log_steps:
-        print(f"Saved mean±SEM plots to {epoch_path} and {step_path}")
+        print(
+            f"Saved mean±SEM plots to {epoch_path}, {mini_path}, and {step_path}"
+        )
     else:
         print(f"Saved mean±SEM plots to {save_dir}")
-    return epoch_path, step_path
+    return epoch_path, mini_path, step_path
 
 
 def save_history(history, save_dir):
@@ -952,8 +1213,89 @@ def cleanup_npy_files(save_dir):
     return removed
 
 
-def run_benchmark(args):
+def _append_epoch_point(
+    history,
+    epoch,
+    *,
+    pc_train,
+    bp_train,
+    pc_test,
+    bp_test,
+    skip_pc,
+    skip_bp=False,
+):
+    history["epoch_train"].append(epoch)
+    history["epoch_eval"].append(epoch)
+    if not skip_bp:
+        history["bp_train_loss_epoch"].append(bp_train[0])
+        history["bp_train_acc_epoch"].append(bp_train[1])
+        history["bp_test_loss"].append(bp_test[0])
+        history["bp_test_acc"].append(bp_test[1])
+    if not skip_pc:
+        history["pc_train_loss_epoch"].append(pc_train[0])
+        history["pc_train_acc_epoch"].append(pc_train[1])
+        history["pc_test_loss"].append(pc_test[0])
+        history["pc_test_acc"].append(pc_test[1])
+
+
+def _append_mini_point(
+    history,
+    frac,
+    *,
+    pc_train,
+    bp_train,
+    pc_test,
+    bp_test,
+    skip_pc,
+    skip_bp=False,
+):
+    history["mini_epoch"].append(frac)
+    if not skip_bp:
+        history["bp_train_loss_mini"].append(bp_train[0])
+        history["bp_train_acc_mini"].append(bp_train[1])
+        history["bp_test_loss_mini"].append(bp_test[0])
+        history["bp_test_acc_mini"].append(bp_test[1])
+    if not skip_pc:
+        history["pc_train_loss_mini"].append(pc_train[0])
+        history["pc_train_acc_mini"].append(pc_train[1])
+        history["pc_test_loss_mini"].append(pc_test[0])
+        history["pc_test_acc_mini"].append(pc_test[1])
+
+
+def _print_eval(
+    label, *, skip_pc, pc_train, pc_test, bp_train, bp_test, skip_bp=False
+):
+    if skip_pc:
+        print(
+            f"  {label}: "
+            f"BP train {bp_train[0]:.4f} ({bp_train[1]:.2f}%)  "
+            f"test {bp_test[0]:.4f} ({bp_test[1]:.2f}%)"
+        )
+        return
+    if skip_bp:
+        print(
+            f"  {label}: "
+            f"PC train {pc_train[0]:.4f} ({pc_train[1]:.2f}%)  "
+            f"test {pc_test[0]:.4f} ({pc_test[1]:.2f}%)"
+        )
+        return
+    print(
+        f"  {label}: "
+        f"PC train {pc_train[0]:.4f} ({pc_train[1]:.2f}%)  "
+        f"test {pc_test[0]:.4f} ({pc_test[1]:.2f}%)  |  "
+        f"BP train {bp_train[0]:.4f} ({bp_train[1]:.2f}%)  "
+        f"test {bp_test[0]:.4f} ({bp_test[1]:.2f}%)"
+    )
+
+
+def run_benchmark(args, save_dir=None):
     spec = DATASET_SPECS[args.dataset]
+    if not hasattr(args, "skip_bp"):
+        args.skip_bp = False
+    if args.skip_pc and args.skip_bp:
+        raise ValueError("Cannot skip both PC and BP")
+    point_kw = dict(skip_pc=args.skip_pc, skip_bp=args.skip_bp)
+    nan_metrics = (float("nan"), float("nan"))
     set_seed(args.seed)
     key = jr.PRNGKey(args.seed)
 
@@ -998,10 +1340,14 @@ def run_benchmark(args):
         activity_optim = optax.sgd(args.activity_lr * args.batch_size)
     else:
         pc_param_optim = pc_opt_state = activity_optim = None
-    bp_param_optim, bp_opt_state = make_bp_param_optim(bp_model, args, depth)
-    bp_step = make_bp_step(args.loss_id)
+    if not args.skip_bp:
+        bp_param_optim, bp_opt_state = make_bp_param_optim(bp_model, args, depth)
+        bp_step = make_bp_step(args.loss_id)
+    else:
+        bp_param_optim = bp_opt_state = bp_step = None
 
-    save_dir = setup_save_dir(args)
+    if save_dir is None:
+        save_dir = setup_save_dir(args)
     os.makedirs(save_dir, exist_ok=True)
     args_to_save = {
         key: value
@@ -1011,7 +1357,12 @@ def run_benchmark(args):
     with open(os.path.join(save_dir, "args.json"), "w", encoding="utf-8") as handle:
         json.dump(args_to_save, handle, indent=2, default=str)
 
-    skip_note = ", skip_pc" if args.skip_pc else ""
+    skip_notes = []
+    if args.skip_pc:
+        skip_notes.append("skip_pc")
+    if args.skip_bp:
+        skip_notes.append("skip_bp")
+    skip_note = f", {', '.join(skip_notes)}" if skip_notes else ""
     print(
         f"Benchmark {args.dataset} ({args.arch}), width={args.width}, "
         f"L={depth}, γ={args.gamma}, λ={output_energy_scaling}, "
@@ -1022,6 +1373,7 @@ def run_benchmark(args):
     history = {
         "epoch_eval": [],
         "epoch_train": [],
+        "mini_epoch": [],
         "pc_train_loss_epoch": [],
         "bp_train_loss_epoch": [],
         "pc_train_acc_epoch": [],
@@ -1030,6 +1382,14 @@ def run_benchmark(args):
         "bp_test_loss": [],
         "pc_test_acc": [],
         "bp_test_acc": [],
+        "pc_train_loss_mini": [],
+        "bp_train_loss_mini": [],
+        "pc_train_acc_mini": [],
+        "bp_train_acc_mini": [],
+        "pc_test_loss_mini": [],
+        "bp_test_loss_mini": [],
+        "pc_test_acc_mini": [],
+        "bp_test_acc_mini": [],
         "pc_train_loss_step": [],
         "bp_train_loss_step": [],
         "pc_train_acc_step": [],
@@ -1038,35 +1398,82 @@ def run_benchmark(args):
     }
 
     print("Evaluating at initialization...")
-    bp_test_loss, bp_test_acc = evaluate_bp(bp_model, args)
-    history["epoch_eval"].append(0)
-    history["bp_test_loss"].append(bp_test_loss)
-    history["bp_test_acc"].append(bp_test_acc)
     if args.skip_pc:
-        print(f"  init  BP test loss={bp_test_loss:.4f} acc={bp_test_acc:.2f}%")
+        _, bp_train = evaluate_train(bp_model, args)
+        bp_test = evaluate_bp(bp_model, args)
+        pc_train = pc_test = nan_metrics
+    elif args.skip_bp:
+        pc_train, _ = evaluate_train(
+            None,
+            args,
+            pc_model=pc_model,
+            skip_model=skip_model,
+            jpc_kw=jpc_kw,
+        )
+        pc_test = evaluate_pc(pc_model, args, skip_model, jpc_kw)
+        bp_train = bp_test = nan_metrics
     else:
-        pc_test_loss, pc_test_acc = evaluate_pc(
-            pc_model, args, skip_model, jpc_kw
+        pc_train, bp_train = evaluate_train(
+            bp_model,
+            args,
+            pc_model=pc_model,
+            skip_model=skip_model,
+            jpc_kw=jpc_kw,
         )
-        history["pc_test_loss"].append(pc_test_loss)
-        history["pc_test_acc"].append(pc_test_acc)
+        pc_test = evaluate_pc(pc_model, args, skip_model, jpc_kw)
+        bp_test = evaluate_bp(bp_model, args)
+    _append_epoch_point(
+        history,
+        0,
+        pc_train=pc_train,
+        bp_train=bp_train,
+        pc_test=pc_test,
+        bp_test=bp_test,
+        **point_kw,
+    )
+    _append_mini_point(
+        history,
+        0.0,
+        pc_train=pc_train,
+        bp_train=bp_train,
+        pc_test=pc_test,
+        bp_test=bp_test,
+        **point_kw,
+    )
+    _print_eval(
+        "init",
+        pc_train=pc_train,
+        pc_test=pc_test,
+        bp_train=bp_train,
+        bp_test=bp_test,
+        **point_kw,
+    )
+    if (
+        not args.skip_pc
+        and not args.skip_bp
+        and abs(pc_test[0] - bp_test[0]) > 1e-3
+    ):
         print(
-            f"  init  PC test loss={pc_test_loss:.4f} acc={pc_test_acc:.2f}%  |  "
-            f"BP test loss={bp_test_loss:.4f} acc={bp_test_acc:.2f}%"
+            "  Warning: PC and BP test losses differ at init; check weight copy."
         )
-        if abs(pc_test_loss - bp_test_loss) > 1e-3:
-            print(
-                "  Warning: PC and BP test losses differ at init; check weight copy."
-            )
+
+    n_expected = n_train_batches(args)
+    boundaries = mini_epoch_boundaries(n_expected, args.n_mini_per_epoch)
 
     global_step = 0
     for epoch in range(1, args.n_epochs + 1):
         pc_loss_sum = bp_loss_sum = 0.0
         pc_acc_sum = bp_acc_sum = 0.0
+        mini_pc_loss_sum = mini_bp_loss_sum = 0.0
+        mini_pc_acc_sum = mini_bp_acc_sum = 0.0
         n_batches = 0
+        mini_n = 0
 
         for x, y in iter_train_batches(args, epoch):
-            bp_loss, bp_acc = bp_batch_metrics(bp_model, x, y, args.loss_id)
+            if not args.skip_bp:
+                bp_loss, bp_acc = bp_batch_metrics(bp_model, x, y, args.loss_id)
+            else:
+                bp_loss = bp_acc = float("nan")
 
             if not args.skip_pc:
                 pc_loss, pc_acc = pc_batch_metrics(
@@ -1097,19 +1504,24 @@ def run_benchmark(args):
                 history["pc_energy_step"].append(energy)
                 pc_loss_sum += pc_loss
                 pc_acc_sum += pc_acc
+                mini_pc_loss_sum += pc_loss
+                mini_pc_acc_sum += pc_acc
             else:
                 energy = float("nan")
 
-            bp_model, bp_opt_state = bp_step(
-                bp_model, bp_opt_state, bp_param_optim, x, y
-            )
+            if not args.skip_bp:
+                bp_model, bp_opt_state = bp_step(
+                    bp_model, bp_opt_state, bp_param_optim, x, y
+                )
+                history["bp_train_loss_step"].append(bp_loss)
+                history["bp_train_acc_step"].append(bp_acc)
+                bp_loss_sum += bp_loss
+                bp_acc_sum += bp_acc
+                mini_bp_loss_sum += bp_loss
+                mini_bp_acc_sum += bp_acc
 
-            history["bp_train_loss_step"].append(bp_loss)
-            history["bp_train_acc_step"].append(bp_acc)
-
-            bp_loss_sum += bp_loss
-            bp_acc_sum += bp_acc
             n_batches += 1
+            mini_n += 1
             global_step += 1
 
             if args.log_steps and global_step % args.log_every == 0:
@@ -1117,6 +1529,12 @@ def run_benchmark(args):
                     print(
                         f"  epoch {epoch} step {global_step}: "
                         f"BP loss={bp_loss:.4f} acc={bp_acc:.2f}%"
+                    )
+                elif args.skip_bp:
+                    print(
+                        f"  epoch {epoch} step {global_step}: "
+                        f"PC loss={pc_loss:.4f} acc={pc_acc:.2f}%  |  "
+                        f"energy={energy:.4f}"
                     )
                 else:
                     print(
@@ -1126,45 +1544,146 @@ def run_benchmark(args):
                         f"energy={energy:.4f}"
                     )
 
+            if n_batches in boundaries and mini_n > 0:
+                frac = (epoch - 1) + n_batches / n_expected
+                at_epoch_end = n_batches == n_expected
+                bp_train_mini = (
+                    (mini_bp_loss_sum / mini_n, mini_bp_acc_sum / mini_n)
+                    if not args.skip_bp
+                    else nan_metrics
+                )
+                pc_train_mini = (
+                    (mini_pc_loss_sum / mini_n, mini_pc_acc_sum / mini_n)
+                    if not args.skip_pc
+                    else nan_metrics
+                )
+                if at_epoch_end:
+                    print(f"Evaluating after epoch {epoch}...")
+                else:
+                    print(f"Evaluating after mini-epoch {frac:.1f}...")
+                bp_test = (
+                    nan_metrics if args.skip_bp else evaluate_bp(bp_model, args)
+                )
+                pc_test = (
+                    nan_metrics
+                    if args.skip_pc
+                    else evaluate_pc(pc_model, args, skip_model, jpc_kw)
+                )
+                _append_mini_point(
+                    history,
+                    frac,
+                    pc_train=pc_train_mini,
+                    bp_train=bp_train_mini,
+                    pc_test=pc_test,
+                    bp_test=bp_test,
+                    **point_kw,
+                )
+                if at_epoch_end:
+                    bp_train_epoch = (
+                        (bp_loss_sum / n_batches, bp_acc_sum / n_batches)
+                        if not args.skip_bp
+                        else nan_metrics
+                    )
+                    pc_train_epoch = (
+                        (pc_loss_sum / n_batches, pc_acc_sum / n_batches)
+                        if not args.skip_pc
+                        else nan_metrics
+                    )
+                    _append_epoch_point(
+                        history,
+                        epoch,
+                        pc_train=pc_train_epoch,
+                        bp_train=bp_train_epoch,
+                        pc_test=pc_test,
+                        bp_test=bp_test,
+                        **point_kw,
+                    )
+                    _print_eval(
+                        f"epoch {epoch}",
+                        pc_train=pc_train_epoch,
+                        pc_test=pc_test,
+                        bp_train=bp_train_epoch,
+                        bp_test=bp_test,
+                        **point_kw,
+                    )
+                else:
+                    _print_eval(
+                        f"mini-epoch {frac:.1f}",
+                        pc_train=pc_train_mini,
+                        pc_test=pc_test,
+                        bp_train=bp_train_mini,
+                        bp_test=bp_test,
+                        **point_kw,
+                    )
+                mini_pc_loss_sum = mini_bp_loss_sum = 0.0
+                mini_pc_acc_sum = mini_bp_acc_sum = 0.0
+                mini_n = 0
+
         if n_batches == 0:
             raise RuntimeError(
                 f"No training batches in epoch {epoch}. Check the dataset path "
                 "or Hugging Face token for ImageNet."
             )
 
-        history["epoch_train"].append(epoch)
-        history["bp_train_loss_epoch"].append(bp_loss_sum / n_batches)
-        history["bp_train_acc_epoch"].append(bp_acc_sum / n_batches)
-        if not args.skip_pc:
-            history["pc_train_loss_epoch"].append(pc_loss_sum / n_batches)
-            history["pc_train_acc_epoch"].append(pc_acc_sum / n_batches)
-
-        print(f"Evaluating after epoch {epoch}...")
-        bp_test_loss, bp_test_acc = evaluate_bp(bp_model, args)
-        history["epoch_eval"].append(epoch)
-        history["bp_test_loss"].append(bp_test_loss)
-        history["bp_test_acc"].append(bp_test_acc)
-        if args.skip_pc:
-            print(
-                f"  epoch {epoch}: "
-                f"BP train {history['bp_train_loss_epoch'][-1]:.4f} "
-                f"({history['bp_train_acc_epoch'][-1]:.2f}%)  "
-                f"test {bp_test_loss:.4f} ({bp_test_acc:.2f}%)"
+        if history["epoch_eval"][-1] != epoch:
+            bp_train_epoch = (
+                (bp_loss_sum / n_batches, bp_acc_sum / n_batches)
+                if not args.skip_bp
+                else nan_metrics
             )
-        else:
-            pc_test_loss, pc_test_acc = evaluate_pc(
-                pc_model, args, skip_model, jpc_kw
+            pc_train_epoch = (
+                (pc_loss_sum / n_batches, pc_acc_sum / n_batches)
+                if not args.skip_pc
+                else nan_metrics
             )
-            history["pc_test_loss"].append(pc_test_loss)
-            history["pc_test_acc"].append(pc_test_acc)
-            print(
-                f"  epoch {epoch}: "
-                f"PC train {history['pc_train_loss_epoch'][-1]:.4f} "
-                f"({history['pc_train_acc_epoch'][-1]:.2f}%)  "
-                f"test {pc_test_loss:.4f} ({pc_test_acc:.2f}%)  |  "
-                f"BP train {history['bp_train_loss_epoch'][-1]:.4f} "
-                f"({history['bp_train_acc_epoch'][-1]:.2f}%)  "
-                f"test {bp_test_loss:.4f} ({bp_test_acc:.2f}%)"
+            if mini_n > 0:
+                frac = (epoch - 1) + n_batches / max(n_expected, n_batches)
+                bp_train_mini = (
+                    (mini_bp_loss_sum / mini_n, mini_bp_acc_sum / mini_n)
+                    if not args.skip_bp
+                    else nan_metrics
+                )
+                pc_train_mini = (
+                    (mini_pc_loss_sum / mini_n, mini_pc_acc_sum / mini_n)
+                    if not args.skip_pc
+                    else nan_metrics
+                )
+            else:
+                frac = float(epoch)
+                bp_train_mini = bp_train_epoch
+                pc_train_mini = pc_train_epoch
+            print(f"Evaluating after epoch {epoch}...")
+            bp_test = nan_metrics if args.skip_bp else evaluate_bp(bp_model, args)
+            pc_test = (
+                nan_metrics
+                if args.skip_pc
+                else evaluate_pc(pc_model, args, skip_model, jpc_kw)
+            )
+            _append_mini_point(
+                history,
+                frac,
+                pc_train=pc_train_mini,
+                bp_train=bp_train_mini,
+                pc_test=pc_test,
+                bp_test=bp_test,
+                **point_kw,
+            )
+            _append_epoch_point(
+                history,
+                epoch,
+                pc_train=pc_train_epoch,
+                bp_train=bp_train_epoch,
+                pc_test=pc_test,
+                bp_test=bp_test,
+                **point_kw,
+            )
+            _print_eval(
+                f"epoch {epoch}",
+                pc_train=pc_train_epoch,
+                pc_test=pc_test,
+                bp_train=bp_train_epoch,
+                bp_test=bp_test,
+                **point_kw,
             )
 
         save_history(history, save_dir)
@@ -1176,6 +1695,7 @@ def run_benchmark(args):
             ),
             log_steps=args.log_steps,
             skip_pc=args.skip_pc,
+            skip_bp=args.skip_bp,
         )
 
     if not args.keep_npy:
@@ -1191,7 +1711,11 @@ def run_benchmark(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="PC vs backprop finite-size dataset benchmark."
+        description=(
+            "PC vs backprop finite-size dataset benchmark. "
+            "Pass a list for any sweepable hyperparameter to run a "
+            "Cartesian search (BP and PC independently)."
+        ),
     )
     parser.add_argument("--results_dir", type=str, default="results_benchmark")
     parser.add_argument(
@@ -1211,13 +1735,29 @@ def parse_args():
         ),
     )
 
-    parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--n_hidden", type=int, default=3, help="MLP hidden layers.")
+    parser.add_argument(
+        "--width",
+        type=int,
+        nargs="+",
+        default=[128],
+        help="Hidden width. Pass multiple values to sweep.",
+    )
+    parser.add_argument(
+        "--n_hidden",
+        type=int,
+        nargs="+",
+        default=[3],
+        help="MLP hidden layers. Pass multiple values to sweep (MLP only).",
+    )
     parser.add_argument(
         "--n_res_blocks",
         type=int,
-        default=3,
-        help="CNN residual blocks (multiple of 3).",
+        nargs="+",
+        default=[3],
+        help=(
+            "CNN residual blocks (multiple of 3). "
+            "Pass multiple values to sweep (CNN only)."
+        ),
     )
     parser.add_argument(
         "--param_type", type=str, default="mupc", choices=["sp", "mupc"]
@@ -1230,22 +1770,55 @@ def parse_args():
     )
     parser.add_argument("--additive_depth_factor", type=int, default=4)
 
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        nargs="+",
+        default=[64],
+        help="Minibatch size. Pass multiple values to sweep.",
+    )
     parser.add_argument("--n_epochs", type=int, default=5)
     parser.add_argument(
-        "--param_optim", type=str, default="adam", choices=["gd", "adam"]
+        "--n_mini_per_epoch",
+        type=int,
+        default=10,
+        help=(
+            "Number of mini-epoch checkpoints per epoch (train window "
+            "average + full test eval). Default 10, i.e. 10× epoch frequency."
+        ),
+    )
+    parser.add_argument(
+        "--param_optim",
+        type=str,
+        default="adam",
+        choices=["gd", "adam", "sgd_momentum"],
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        default=0.9,
+        help="Momentum for --param_optim sgd_momentum (ignored otherwise).",
     )
     parser.add_argument(
         "--param_lr",
         type=float,
-        default=1e-3,
-        help="Backprop parameter learning rate.",
+        nargs="+",
+        default=[1e-3],
+        help=(
+            "Backprop parameter learning rate. "
+            "Pass multiple values to sweep BP only."
+        ),
     )
     parser.add_argument(
         "--param_lr_pc",
         type=float,
-        default=1e-3,
-        help="PC parameter learning rate (Adam: divided like BP).",
+        nargs="+",
+        default=[1e-3],
+        help=(
+            "PC parameter learning rate (Adam: divided like BP; "
+            "GD / SGD+momentum: used as-is). "
+            "Pass multiple values to sweep PC only."
+        ),
     )
     parser.add_argument("--loss_id", type=str, default="ce", choices=["mse", "ce"])
     parser.add_argument("--seed", type=int, default=0)
@@ -1259,10 +1832,22 @@ def parse_args():
             "writes mean±SEM overlay plots under a seeds_* directory."
         ),
     )
-    parser.add_argument("--log_every", type=int, default=50)
+    parser.add_argument("--log_every", type=int, default=100)
 
-    parser.add_argument("--activity_lr", type=float, default=0.3)
-    parser.add_argument("--n_infer_iters", type=int, default=10)
+    parser.add_argument(
+        "--activity_lr",
+        type=float,
+        nargs="+",
+        default=[0.3],
+        help="PC activity learning rate. Pass multiple values to sweep PC only.",
+    )
+    parser.add_argument(
+        "--n_infer_iters",
+        type=int,
+        nargs="+",
+        default=[10],
+        help="PC inference steps. Pass multiple values to sweep PC only.",
+    )
     parser.add_argument(
         "--keep_npy",
         action="store_true",
@@ -1287,10 +1872,495 @@ def parse_args():
         default=False,
         help=(
             "Skip PC training/eval and plot backprop only. "
+            "In a sweep, skip the PC grid. "
             "Default: train and plot both PC and BP."
         ),
     )
+    parser.add_argument(
+        "--skip_bp",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip backprop training/eval and plot PC only. "
+            "In a sweep, skip the BP grid."
+        ),
+    )
     return parser.parse_args()
+
+
+SWEEP_ALL_KEYS = (
+    "n_hidden",
+    "width",
+    "batch_size",
+    "n_res_blocks",
+    "param_lr",
+    "param_lr_pc",
+    "activity_lr",
+    "n_infer_iters",
+)
+SWEEP_BP_ONLY = ("param_lr",)
+SWEEP_PC_ONLY = ("param_lr_pc", "activity_lr", "n_infer_iters")
+
+
+def _as_values(args, key):
+    val = getattr(args, key)
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    return [val]
+
+
+def _scalarize_sweep_fields(args):
+    """Replace list-valued sweep fields with their first (or only) element."""
+    for key in SWEEP_ALL_KEYS:
+        val = getattr(args, key)
+        if isinstance(val, (list, tuple)):
+            if len(val) < 1:
+                raise ValueError(f"--{key} must contain at least one value")
+            setattr(args, key, val[0])
+    return args
+
+
+def shared_sweep_keys(arch):
+    keys = ["width"]
+    if arch == "mlp":
+        keys.append("n_hidden")
+    else:
+        keys.append("n_res_blocks")
+    keys.append("batch_size")
+    return keys
+
+
+def active_sweep_keys(arch):
+    return (
+        shared_sweep_keys(arch)
+        + list(SWEEP_BP_ONLY)
+        + list(SWEEP_PC_ONLY)
+    )
+
+
+def is_hp_sweep(args):
+    return any(len(_as_values(args, key)) > 1 for key in active_sweep_keys(args.arch))
+
+
+def cartesian_grid(args, keys):
+    if not keys:
+        return [{}]
+    axes = [_as_values(args, key) for key in keys]
+    return [dict(zip(keys, combo)) for combo in product(*axes)]
+
+
+def _public_args_dict(args):
+    return {
+        key: value
+        for key, value in vars(args).items()
+        if not key.startswith("_")
+    }
+
+
+def _json_number(value):
+    if isinstance(value, (np.floating, float)):
+        return float(value)
+    if isinstance(value, (np.integer, int)) and not isinstance(value, bool):
+        return int(value)
+    return value
+
+
+def _energy_depth(args):
+    if args.arch == "mlp":
+        return args.n_hidden + 1
+    return cnn_energy_depth(args.n_res_blocks, args.additive_depth_factor)
+
+
+def make_run_args(base_args, hparams=None, **overrides):
+    run_args = argparse.Namespace(**vars(base_args))
+    if hparams:
+        for key, value in hparams.items():
+            setattr(run_args, key, value)
+    _scalarize_sweep_fields(run_args)
+    for key, value in overrides.items():
+        setattr(run_args, key, value)
+    run_args._train_loader = None
+    run_args._test_loader = None
+    return run_args
+
+
+def _hp_value_str(value):
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def sweep_config_dir(sweep_dir, method, hparams):
+    """``hp_sweep/{bp|pc}/width=256/n_hidden=3/param_lr=0.02``."""
+    parts = [sweep_dir, str(method).lower()]
+    for key, value in hparams.items():
+        parts.append(f"{key}={_hp_value_str(value)}")
+    return os.path.join(*parts)
+
+
+def plot_seed_aggregate(args, histories, save_dir=None):
+    """Mean±SEM plots across seeds for a scalar hyperparameter config."""
+    if args.n_seeds <= 1:
+        return None
+    if save_dir is None:
+        seed_tag = f"seeds_{args.seed}_{args.seed + args.n_seeds - 1}"
+        save_dir = setup_save_dir(args, seed_tag=seed_tag)
+    depth = _energy_depth(args)
+    plot_metrics_mean_sem(
+        histories,
+        os.path.join(save_dir, "plots"),
+        title_suffix=(
+            f" ({args.dataset}, {args.arch}, N={args.width}, L={depth})"
+        ),
+        log_steps=args.log_steps,
+        skip_pc=args.skip_pc,
+        skip_bp=getattr(args, "skip_bp", False),
+    )
+    with open(os.path.join(save_dir, "args.json"), "w", encoding="utf-8") as handle:
+        json.dump(_public_args_dict(args), handle, indent=2, default=str)
+    print(f"Aggregated mean±SEM plots in {save_dir}")
+    return save_dir
+
+
+def _history_last(history, key):
+    values = history.get(key, [])
+    if not values:
+        return float("nan")
+    return float(values[-1])
+
+
+def final_metrics_from_history(history, *, skip_pc, skip_bp):
+    prefix = "pc" if skip_bp else "bp"
+    return {
+        "test_acc": _history_last(history, f"{prefix}_test_acc"),
+        "test_loss": _history_last(history, f"{prefix}_test_loss"),
+        "train_acc": _history_last(history, f"{prefix}_train_acc_epoch"),
+        "train_loss": _history_last(history, f"{prefix}_train_loss_epoch"),
+    }
+
+
+def _mean_sem(values):
+    arr = np.asarray(values, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float("nan"), float("nan")
+    mean = float(finite.mean())
+    if finite.size == 1:
+        return mean, 0.0
+    return mean, float(finite.std(ddof=1) / np.sqrt(finite.size))
+
+
+def aggregate_seed_records(records):
+    summary = {}
+    for key in (
+        "test_acc",
+        "test_loss",
+        "train_acc",
+        "train_loss",
+        "wall_time_s",
+    ):
+        mean, sem = _mean_sem([record[key] for record in records])
+        summary[f"mean_{key}"] = mean
+        summary[f"sem_{key}"] = sem
+    summary["n_seeds"] = len(records)
+    summary["seeds"] = records
+    return summary
+
+
+def rank_by_mean_test_acc(results):
+    def score(result):
+        value = result.get("mean_test_acc", float("nan"))
+        return value if np.isfinite(value) else float("-inf")
+
+    return sorted(results, key=score, reverse=True)
+
+
+def _format_hp(hparams):
+    parts = []
+    for key, value in hparams.items():
+        parts.append(f"{key}={_hp_value_str(value)}")
+    return ", ".join(parts)
+
+
+def _print_ranked_table(title, ranked):
+    print(f"\n=== {title} ===")
+    if not ranked:
+        print("  (no configs)")
+        return
+    header = (
+        f"{'rank':>4}  {'test_acc':>10}  {'train_acc':>10}  "
+        f"{'test_loss':>10}  {'train_loss':>10}  {'wall_s':>8}  hyperparams"
+    )
+    print(header)
+    for rank, result in enumerate(ranked, start=1):
+        print(
+            f"{rank:4d}  "
+            f"{result['mean_test_acc']:10.2f}  "
+            f"{result['mean_train_acc']:10.2f}  "
+            f"{result['mean_test_loss']:10.4f}  "
+            f"{result['mean_train_loss']:10.4f}  "
+            f"{result['mean_wall_time_s']:8.1f}  "
+            f"{_format_hp(result['hyperparams'])}"
+        )
+    best = ranked[0]
+    print(
+        f"Best: {_format_hp(best['hyperparams'])}  "
+        f"(mean test acc {best['mean_test_acc']:.2f}% ± {best['sem_test_acc']:.2f})"
+    )
+
+
+def run_config_with_seeds(
+    base_args, hparams, *, skip_pc, skip_bp, method_label, sweep_dir
+):
+    records = []
+    histories = []
+    config_dir = sweep_config_dir(sweep_dir, method_label, hparams)
+    seeds = range(base_args.seed, base_args.seed + base_args.n_seeds)
+    for seed in seeds:
+        run_args = make_run_args(
+            base_args, hparams, skip_pc=skip_pc, skip_bp=skip_bp, seed=seed
+        )
+        seed_dir = os.path.join(config_dir, f"seed={seed}")
+        print(f"\n=== {method_label} seed={seed} | {_format_hp(hparams)} ===")
+        t0 = time.perf_counter()
+        save_dir, history = run_benchmark(run_args, save_dir=seed_dir)
+        wall_time_s = time.perf_counter() - t0
+        metrics = final_metrics_from_history(
+            history, skip_pc=skip_pc, skip_bp=skip_bp
+        )
+        record = {
+            "seed": int(seed),
+            "save_dir": save_dir,
+            "wall_time_s": float(wall_time_s),
+            "test_acc": _json_number(metrics["test_acc"]),
+            "test_loss": _json_number(metrics["test_loss"]),
+            "train_acc": _json_number(metrics["train_acc"]),
+            "train_loss": _json_number(metrics["train_loss"]),
+        }
+        records.append(record)
+        histories.append(history)
+        print(
+            f"  finished in {wall_time_s:.1f}s  "
+            f"test acc={metrics['test_acc']:.2f}%  "
+            f"train acc={metrics['train_acc']:.2f}%"
+        )
+
+    if base_args.n_seeds > 1:
+        agg_args = make_run_args(
+            base_args,
+            hparams,
+            skip_pc=skip_pc,
+            skip_bp=skip_bp,
+            seed=base_args.seed,
+        )
+        plot_seed_aggregate(
+            agg_args, histories, save_dir=os.path.join(config_dir, "mean_sem")
+        )
+
+    summary = aggregate_seed_records(records)
+    summary["hyperparams"] = {
+        key: _json_number(value) for key, value in hparams.items()
+    }
+    summary["method"] = method_label
+    summary["dir"] = os.path.relpath(config_dir, sweep_dir)
+    return summary
+
+
+def _grid_values(args, keys):
+    return {key: [_json_number(v) for v in _as_values(args, key)] for key in keys}
+
+
+def _fixed_training_args(args):
+    """Non-swept training settings (omit CLI bookkeeping flags)."""
+    keys = [
+        "act_fn",
+        "param_type",
+        "gamma",
+        "param_optim",
+        "use_skips",
+        "n_mini_per_epoch",
+    ]
+    if args.param_optim == "sgd_momentum":
+        keys.append("momentum")
+    if args.arch == "cnn":
+        keys.extend(["scale_non_res_layers", "additive_depth_factor"])
+    fixed = {}
+    for key in keys:
+        value = getattr(args, key)
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                continue
+            value = value[0]
+        if key in ("use_skips", "scale_non_res_layers") and not value:
+            continue
+        fixed[key] = _json_number(value)
+    return fixed
+
+
+def _compact_seed(record):
+    return {
+        "seed": record["seed"],
+        "test_acc": record["test_acc"],
+        "train_acc": record["train_acc"],
+        "test_loss": record["test_loss"],
+        "train_loss": record["train_loss"],
+        "wall_time_s": round(record["wall_time_s"], 2),
+    }
+
+
+def _round_metric(value, digits=4):
+    if value is None or not np.isfinite(value):
+        return None
+    return round(float(value), digits)
+
+
+def _compact_result(result, rank, n_seeds):
+    """Flatten hyperparams + metrics into one object for the sweep JSON."""
+    row = {"rank": rank}
+    row.update(result["hyperparams"])
+    row["test_acc"] = _round_metric(result["mean_test_acc"], 2)
+    row["train_acc"] = _round_metric(result["mean_train_acc"], 2)
+    row["test_loss"] = _round_metric(result["mean_test_loss"])
+    row["train_loss"] = _round_metric(result["mean_train_loss"])
+    row["wall_time_s"] = _round_metric(result["mean_wall_time_s"], 2)
+    if n_seeds > 1:
+        row["test_acc_sem"] = _round_metric(result["sem_test_acc"], 2)
+        row["train_acc_sem"] = _round_metric(result["sem_train_acc"], 2)
+        row["test_loss_sem"] = _round_metric(result["sem_test_loss"])
+        row["train_loss_sem"] = _round_metric(result["sem_train_loss"])
+        row["wall_time_s_sem"] = _round_metric(result["sem_wall_time_s"], 2)
+    row["dir"] = result["dir"]
+    if n_seeds > 1:
+        row["seeds"] = [_compact_seed(record) for record in result["seeds"]]
+    return row
+
+
+def _compact_best(result, n_seeds):
+    if result is None:
+        return None
+    best = _compact_result(result, rank=1, n_seeds=n_seeds)
+    best.pop("rank", None)
+    best.pop("seeds", None)
+    return best
+
+
+def warn_unused_arch_sweep_axes(args):
+    if args.arch == "mlp" and len(_as_values(args, "n_res_blocks")) > 1:
+        print(
+            "Warning: --n_res_blocks is unused for MLP; extra values are ignored."
+        )
+    if args.arch == "cnn" and len(_as_values(args, "n_hidden")) > 1:
+        print(
+            "Warning: --n_hidden is unused for CNN; extra values are ignored."
+        )
+
+
+def run_hp_sweep(args):
+    shared_keys = shared_sweep_keys(args.arch)
+    bp_keys = shared_keys + list(SWEEP_BP_ONLY)
+    pc_keys = shared_keys + list(SWEEP_PC_ONLY)
+    do_bp = not args.skip_bp
+    do_pc = not args.skip_pc
+    bp_grid = cartesian_grid(args, bp_keys) if do_bp else []
+    pc_grid = cartesian_grid(args, pc_keys) if do_pc else []
+
+    print(
+        f"Hyperparameter sweep on {args.dataset} ({args.arch}): "
+        f"{len(bp_grid)} BP configs × {args.n_seeds} seed(s), "
+        f"{len(pc_grid)} PC configs × {args.n_seeds} seed(s)."
+    )
+    print(
+        "Selection metric: mean final test accuracy. "
+        "BP grid keys: "
+        + ", ".join(f"{k}={_as_values(args, k)}" for k in bp_keys)
+    )
+    print(
+        "PC grid keys: "
+        + ", ".join(f"{k}={_as_values(args, k)}" for k in pc_keys)
+    )
+
+    sweep_dir = os.path.join(
+        args.results_dir, args.dataset, args.arch, args.loss_id, "hp_sweep"
+    )
+    os.makedirs(sweep_dir, exist_ok=True)
+
+    t_sweep = time.perf_counter()
+    bp_results = []
+    for i, hparams in enumerate(bp_grid, start=1):
+        print(f"\n----- BP config {i}/{len(bp_grid)}: {_format_hp(hparams)} -----")
+        bp_results.append(
+            run_config_with_seeds(
+                args,
+                hparams,
+                skip_pc=True,
+                skip_bp=False,
+                method_label="BP",
+                sweep_dir=sweep_dir,
+            )
+        )
+    pc_results = []
+    for i, hparams in enumerate(pc_grid, start=1):
+        print(f"\n----- PC config {i}/{len(pc_grid)}: {_format_hp(hparams)} -----")
+        pc_results.append(
+            run_config_with_seeds(
+                args,
+                hparams,
+                skip_pc=False,
+                skip_bp=True,
+                method_label="PC",
+                sweep_dir=sweep_dir,
+            )
+        )
+
+    bp_ranked = rank_by_mean_test_acc(bp_results)
+    pc_ranked = rank_by_mean_test_acc(pc_results)
+    total_wall_time_s = time.perf_counter() - t_sweep
+    n_seeds = args.n_seeds
+    bp_rows = [
+        _compact_result(result, rank, n_seeds)
+        for rank, result in enumerate(bp_ranked, start=1)
+    ]
+    pc_rows = [
+        _compact_result(result, rank, n_seeds)
+        for rank, result in enumerate(pc_ranked, start=1)
+    ]
+
+    summary = {
+        "dataset": args.dataset,
+        "arch": args.arch,
+        "loss": args.loss_id,
+        "n_epochs": args.n_epochs,
+        "n_seeds": n_seeds,
+        "base_seed": args.seed,
+        "metric": "final test accuracy (mean over seeds)",
+        "wall_time_s": _round_metric(total_wall_time_s, 1),
+        "fixed": _fixed_training_args(args),
+        "grid": {
+            "bp": _grid_values(args, bp_keys) if do_bp else {},
+            "pc": _grid_values(args, pc_keys) if do_pc else {},
+        },
+        "best": {
+            "bp": _compact_best(bp_ranked[0] if bp_ranked else None, n_seeds),
+            "pc": _compact_best(pc_ranked[0] if pc_ranked else None, n_seeds),
+        },
+        "bp": bp_rows,
+        "pc": pc_rows,
+    }
+
+    summary_path = os.path.join(sweep_dir, "sweep_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    with open(os.path.join(sweep_dir, "best_bp.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary["best"]["bp"], handle, indent=2)
+    with open(os.path.join(sweep_dir, "best_pc.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary["best"]["pc"], handle, indent=2)
+
+    _print_ranked_table("BP sweep (mean final test accuracy)", bp_ranked)
+    _print_ranked_table("PC sweep (mean final test accuracy)", pc_ranked)
+    print(f"\nSweep wall time: {total_wall_time_s:.1f}s")
+    print(f"Sweep runs: {os.path.join(sweep_dir, 'bp')} and {os.path.join(sweep_dir, 'pc')}")
+    print(f"Sweep summary written to {summary_path}")
+    return summary
 
 
 if __name__ == "__main__":
@@ -1301,49 +2371,23 @@ if __name__ == "__main__":
         print(f"Using default --arch {args.arch} for {args.dataset}")
     if args.n_seeds < 1:
         raise SystemExit("--n_seeds must be >= 1")
+    if args.n_mini_per_epoch < 1:
+        raise SystemExit("--n_mini_per_epoch must be >= 1")
+    if args.skip_pc and args.skip_bp:
+        raise SystemExit("Cannot use --skip_pc and --skip_bp together")
 
-    base_seed = args.seed
-    histories = []
-    for seed in range(base_seed, base_seed + args.n_seeds):
-        run_args = argparse.Namespace(**vars(args))
-        run_args.seed = seed
-        # Drop non-serialisable loader handles before the next seed.
-        run_args._train_loader = None
-        run_args._test_loader = None
-        _, history = run_benchmark(run_args)
-        histories.append(history)
-
-    if args.n_seeds > 1:
-        seed_tag = f"seeds_{base_seed}_{base_seed + args.n_seeds - 1}"
-        agg_dir = setup_save_dir(args, seed_tag=seed_tag)
-        depth = (
-            args.n_hidden + 1
-            if args.arch == "mlp"
-            else cnn_energy_depth(args.n_res_blocks, args.additive_depth_factor)
-        )
-        plot_metrics_mean_sem(
-            histories,
-            os.path.join(agg_dir, "plots"),
-            title_suffix=(
-                f" ({args.dataset}, {args.arch}, N={args.width}, L={depth})"
-            ),
-            log_steps=args.log_steps,
-            skip_pc=args.skip_pc,
-        )
-        with open(
-            os.path.join(agg_dir, "args.json"), "w", encoding="utf-8"
-        ) as handle:
-            json.dump(
-                {
-                    key: value
-                    for key, value in vars(args).items()
-                    if not key.startswith("_")
-                },
-                handle,
-                indent=2,
-                default=str,
-            )
-        print(f"Aggregated mean±SEM plots in {agg_dir}")
+    warn_unused_arch_sweep_axes(args)
+    if is_hp_sweep(args):
+        run_hp_sweep(args)
+    else:
+        _scalarize_sweep_fields(args)
+        histories = []
+        base_seed = args.seed
+        for seed in range(base_seed, base_seed + args.n_seeds):
+            run_args = make_run_args(args, seed=seed)
+            _, history = run_benchmark(run_args)
+            histories.append(history)
+        plot_seed_aggregate(args, histories)
 
 
 
@@ -1356,8 +2400,23 @@ if __name__ == "__main__":
 # # ImageNet (HF streaming)
 # python train_benchmark.py --dataset ImageNet --n_epochs 1 --batch_size 64 --width 256 --n_res_blocks 3 --n_hidden 3 --param_lr 0.01 --param_lr_pc 0.1 --activity_lr 0.1 --n_infer_iters 50 --param_optim adam --act_fn relu
 
+# # Hyperparameter sweep (BP and PC independently; rank by mean final test acc)
+# python train_benchmark.py --dataset MNIST --n_epochs 5 --n_seeds 3 \
+#   --width 256 --n_hidden 3 --batch_size 64 \
+#   --param_lr 0.001 0.01 0.1 \
+#   --param_lr_pc 0.01 0.1 \
+#   --activity_lr 0.05 0.1 \
+#   --n_infer_iters 50 100
+#   --results_dir results_sweep
 
-### Testing
+# # CNN sweep including residual-block depth
+# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 10 \
+#   --width 128 256 --n_res_blocks 3 6 --batch_size 64 \
+#   --param_lr 0.001 0.01 \
+#   --param_lr_pc 0.01 0.1 --activity_lr 0.1 --n_infer_iters 50
+#   --results_dir results_sweep
 
+
+### Testing MLP on MNIST
 # python train_benchmark.py --dataset MNIST --n_epochs 10 --batch_size 64 --width 256 --n_hidden 2 --param_lr 0.01 --param_lr_pc 0.01 --activity_lr 0.1 --n_infer_iters 100 --param_optim adam --act_fn tanh --log_steps
 # python train_benchmark.py --dataset MNIST --n_epochs 10 --batch_size 64 --width 256 --n_hidden 3 --param_lr 0.01 --param_lr_pc 0.02 --activity_lr 0.05 --n_infer_iters 200 --param_optim adam --act_fn relu
