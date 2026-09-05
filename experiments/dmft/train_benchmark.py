@@ -675,7 +675,7 @@ def _plot_overlay(ax, xs_pc, ys_pc, xs_bp, ys_bp, xlabel, ylabel):
     ax.legend(fontsize=8)
 
 
-def plot_metrics(history, save_dir, title_suffix=""):
+def plot_metrics(history, save_dir, title_suffix="", log_steps=False):
     os.makedirs(save_dir, exist_ok=True)
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
@@ -746,7 +746,8 @@ def plot_metrics(history, save_dir, title_suffix=""):
     step_path = os.path.join(save_dir, "pc_bp_step_metrics.png")
     fig.savefig(step_path, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved plots to {epoch_path} and {step_path}")
+    if log_steps:
+        print(f"Saved plots to {epoch_path} and {step_path}")
     return epoch_path, step_path
 
 
@@ -754,6 +755,18 @@ def save_history(history, save_dir):
     os.makedirs(save_dir, exist_ok=True)
     for key, value in history.items():
         np.save(os.path.join(save_dir, f"{key}.npy"), np.asarray(value))
+
+
+def cleanup_npy_files(save_dir):
+    """Remove ``*.npy`` history dumps under ``save_dir`` (plots / args kept)."""
+    removed = []
+    root = Path(save_dir)
+    if not root.is_dir():
+        return removed
+    for path in sorted(root.glob("*.npy")):
+        path.unlink()
+        removed.append(str(path))
+    return removed
 
 
 def run_benchmark(args):
@@ -906,7 +919,7 @@ def run_benchmark(args):
             n_batches += 1
             global_step += 1
 
-            if global_step % args.log_every == 0:
+            if args.log_steps and global_step % args.log_every == 0:
                 print(
                     f"  epoch {epoch} step {global_step}: "
                     f"PC loss={pc_loss:.4f} acc={pc_acc:.2f}%  |  "
@@ -953,7 +966,15 @@ def run_benchmark(args):
             title_suffix=(
                 f" ({args.dataset}, {args.arch}, N={args.width}, L={depth})"
             ),
+            log_steps=args.log_steps,
         )
+
+    if not args.keep_npy:
+        removed = cleanup_npy_files(save_dir)
+        if removed:
+            print(f"Removed {len(removed)} .npy file(s) under {save_dir}")
+        else:
+            print(f"No .npy files to remove under {save_dir}")
 
     print(f"Done. Results in {save_dir}")
     return save_dir
@@ -1024,6 +1045,24 @@ def parse_args():
 
     parser.add_argument("--activity_lr", type=float, default=0.3)
     parser.add_argument("--n_infer_iters", type=int, default=10)
+    parser.add_argument(
+        "--keep_npy",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep history *.npy files under the run directory. "
+            "By default they are deleted after plots are written."
+        ),
+    )
+    parser.add_argument(
+        "--log_steps",
+        action="store_true",
+        default=False,
+        help=(
+            "Print per-step train metrics (every --log_every steps) and "
+            "plot save paths."
+        ),
+    )
     return parser.parse_args()
 
 
