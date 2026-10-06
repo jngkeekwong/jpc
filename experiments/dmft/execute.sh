@@ -167,7 +167,10 @@ python() {
 #################################
 
 # # CNN, CIFAR-10
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --results_dir results_cifar
+# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 100 --param_optim sgd_momentum --act_fn relu --hidden_energy_reduce spatial_mean --results_dir results_cifar
+
+# # CNN, CIFAR-10: fold pools out of the PC graph
+# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.005 --n_infer_iters 100 --param_optim sgd_momentum --act_fn relu --hidden_energy_reduce spatial_mean --collapse_pools --results_dir results_cifar_collapse
 
 # CNN L / κ variants (defaults: --resnet_fwd_l n_res_blocks, --resnet_energy_l n_weight_layers, --hidden_energy_layers weight)
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers weight --results_dir results_cifar_l_default

@@ -41,12 +41,24 @@ Energy scalings match ``train.py`` / ``train_pcn`` for MLPs:
 with a single ``L = n_hidden + 1``. CNNs split this into two depths
 (``--resnet_fwd_l``, ``--resnet_energy_l``; see those flags). Hidden
 precision can be restricted with ``--hidden_energy_layers``.
+``--collapse_pools`` folds each AvgPool into the next weight layer.
+Without it, pool maps stay free activities. ``--hidden_energy_reduce
+spatial_mean`` matches an MLP readout on this fan-in:
+``λ = γ² N L (H_r W_r)`` and ``κ_ℓ = L (H_r W_r) / (H_ℓ W_ℓ)`` on every
+hidden map, including free pools. ``--infer_spatial_lr`` (default on)
+multiplies map ``ℓ``'s activity gradient by ``(H_ℓ W_ℓ) / (H_r W_r)``,
+so one local step still copies a fraction ``activity_lr · L``. ``β`` and
+``η`` stay the MLP values. The readout multiplies by ``1/(γ N H_r W_r)``.
+Inference is K steps of that gradient on every free activity.
 
 For Adam, the PC parameter LR is divided the same way as BP
 (``1/√N``, or ``1/√(N L)`` with MLP skips). GD and SGD+momentum keep the
 ``train.py`` convention: PC uses the raw ``--param_lr_pc`` (scale lives
-in the energy); BP bakes ``γ² N`` into the optimiser. No Adam-style
-``1/√N`` rescaling is applied for SGD+momentum.
+in the energy). BP bakes ``γ²`` times the readout fan-in into the
+optimiser: ``N`` for an MLP, ``N H_r W_r`` for a CNN, so the step cancels
+``1/(γ fan-in)``. With ``spatial_mean``, PC's ``λ`` carries one extra
+``L`` over that same fan-in, as in the MLP. No Adam-style ``1/√N``
+rescaling is applied for SGD+momentum.
 
 CNN residual blocks still use the per-parameter Adam tree from
 ``configure_cnn_param_optim``, with residual Adam LRs using ``L_fwd``.
@@ -207,11 +219,17 @@ def mlp_adam_lr(param_lr, param_type, use_skips, width, depth):
     return param_lr / np.sqrt(width)
 
 
-def bp_gd_style_lr(args):
-    """BP GD / SGD+momentum LR: µP bakes ``γ² N`` into the optimiser."""
+def bp_gd_style_lr(args, fan_in=None):
+    """BP GD / SGD+momentum LR.
+
+    µP bakes ``γ²`` times the readout fan-in into the optimiser. That
+    fan-in is ``N`` for an MLP and ``N H_r W_r`` for a CNN, cancelling the
+    forward factor ``1/(γ fan-in)``.
+    """
     if args.param_type == "sp":
         return args.param_lr
-    return args.param_lr * (args.gamma ** 2) * args.width
+    n = args.width if fan_in is None else fan_in
+    return args.param_lr * (args.gamma ** 2) * n
 
 
 def make_sgd_param_optim(learning_rate, args):
@@ -688,6 +706,7 @@ def make_models(key, args, spec):
         act_fn=args.act_fn,
         scale_non_res_layers=args.scale_non_res_layers,
         additive_depth_factor=fwd_additive,
+        gamma=args.gamma,
     )
     bp_model = ResNet(
         key=key,
@@ -700,6 +719,7 @@ def make_models(key, args, spec):
         act_fn=args.act_fn,
         scale_non_res_layers=args.scale_non_res_layers,
         additive_depth_factor=fwd_additive,
+        gamma=args.gamma,
     )
     bp_model = copy_eqx_arrays(pc_model, bp_model)
     return pc_model, bp_model, None
@@ -757,9 +777,19 @@ def make_pc_param_optim(pc_model, skip_model, args, depth):
     return param_optim, opt_state
 
 
+def _bp_readout_fan_in(args, model):
+    """Units the readout sums over. CNN: ``N H_r W_r``. MLP: ``N``."""
+    if args.arch == "cnn" and args.param_type != "sp":
+        return int(model.layers[-1].linear.weight.shape[-1])
+    return args.width
+
+
 def make_bp_param_optim(bp_model, args, depth):
-    if args.param_optim == "sgd_momentum":
-        optim = make_sgd_param_optim(bp_gd_style_lr(args), args)
+    if args.param_optim in ("gd", "sgd_momentum") and (
+        args.arch == "cnn" or args.param_optim == "sgd_momentum"
+    ):
+        fan_in = _bp_readout_fan_in(args, bp_model)
+        optim = make_sgd_param_optim(bp_gd_style_lr(args, fan_in=fan_in), args)
         return optim, optim.init(eqx.filter(bp_model, eqx.is_array))
 
     if args.arch == "cnn":
@@ -967,7 +997,7 @@ def pc_infer_and_update(
         )
         energy = float(energy)
         if not np.isfinite(energy):
-            return model, skip_model, param_opt_state, energy, False
+            return model, skip_model, param_opt_state, energy, False, None
         param_result = jpc.update_linear_equilib_energy_params(
             params=params,
             optim=param_optim,
@@ -984,14 +1014,20 @@ def pc_infer_and_update(
             param_result["opt_state"],
             energy,
             True,
+            None,
         )
 
-    activities = jpc.init_activities_with_ffwd(
-        model=model,
-        input=x,
-        skip_model=skip_model,
-        **jpc_kw,
+    activities = (
+        cnn_pc.init_activities_collapse_pools(model, x)
+        if args.arch == "cnn" and getattr(args, "collapse_pools", False)
+        else jpc.init_activities_with_ffwd(
+            model=model,
+            input=x,
+            skip_model=skip_model,
+            **jpc_kw,
+        )
     )
+    init_activities = activities
     activity_opt_state = activity_optim.init(activities)
     energy = None
     update_activities = (
@@ -1003,6 +1039,29 @@ def pc_infer_and_update(
         cnn_pc.update_pc_params if args.arch == "cnn" else jpc.update_pc_params
     )
     extra_kw = {} if args.arch == "cnn" else jpc_kw
+    collapse = args.arch == "cnn" and bool(getattr(args, "collapse_pools", False))
+    act_kw = dict(collapse_pools=collapse) if args.arch == "cnn" else {}
+    if (
+        args.arch == "cnn"
+        and getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean"
+        and bool(getattr(args, "infer_spatial_lr", True))
+    ):
+        # κ_ℓ = L (H_r W_r) / (H_ℓ W_ℓ). Dividing the H_ℓ W_ℓ factor by
+        # H_r W_r leaves effective spring L, so the step copies activity_lr * L.
+        hw_r = float(getattr(args, "_readout_spatial_hw"))
+        hw_scales = [
+            cnn_pc.activity_hw(z) / hw_r for z in activities[:-1]
+        ]
+        hw_scales.append(1.0)
+        hw_scales = jnp.asarray(hw_scales, dtype=jnp.float32)
+        if not getattr(args, "_infer_spatial_lr_banner", False):
+            print(
+                "  spatial activity scales (HW / HW_r): "
+                + " ".join(f"{float(v):.4g}" for v in np.asarray(hw_scales))
+            )
+            args._infer_spatial_lr_banner = True
+        act_kw["activity_grad_scales"] = hw_scales
+    param_kw = dict(collapse_pools=collapse) if args.arch == "cnn" else {}
     for _ in range(args.n_infer_iters):
         result = update_activities(
             params=params,
@@ -1015,14 +1074,23 @@ def pc_infer_and_update(
             output_energy_scaling=output_energy_scaling,
             hidden_energy_scaling=hidden_energy_scaling,
             **extra_kw,
+            **act_kw,
         )
-        activities = result["activities"]
         activity_opt_state = result["opt_state"]
+        activities = result["activities"]
         energy = result["energy"]
 
     energy = float(energy)
+    deltas = None
+    if args.arch == "cnn":
+        deltas = [
+            float(v)
+            for v in np.asarray(
+                cnn_pc.activity_rms_deltas(activities, init_activities)
+            )
+        ]
     if not np.isfinite(energy):
-        return model, skip_model, param_opt_state, energy, False
+        return model, skip_model, param_opt_state, energy, False, deltas
 
     param_result = update_params(
         params=params,
@@ -1035,6 +1103,7 @@ def pc_infer_and_update(
         output_energy_scaling=output_energy_scaling,
         hidden_energy_scaling=hidden_energy_scaling,
         **extra_kw,
+        **param_kw,
     )
     return (
         param_result["model"],
@@ -1042,6 +1111,7 @@ def pc_infer_and_update(
         param_result["opt_state"],
         energy,
         True,
+        deltas,
     )
 
 
@@ -1112,8 +1182,21 @@ def setup_save_dir(args, seed_tag=None):
                 f"{getattr(args, 'resnet_fwd_l', 'n_res_blocks')}_resnet_fwd_l",
                 f"{getattr(args, 'resnet_energy_l', 'n_weight_layers')}_resnet_energy_l",
                 f"{getattr(args, 'hidden_energy_layers', 'weight')}_hidden_energy_layers",
+                f"{getattr(args, 'collapse_pools', False)}_collapse_pools",
             ]
             if args.arch == "cnn"
+            else []
+        ),
+        *(
+            [f"{getattr(args, 'hidden_energy_reduce', 'sum')}_hidden_energy_reduce"]
+            if args.arch == "cnn"
+            and getattr(args, "hidden_energy_reduce", "sum") != "sum"
+            else []
+        ),
+        *(
+            [f"{getattr(args, 'infer_spatial_lr', True)}_infer_spatial_lr"]
+            if args.arch == "cnn"
+            and getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean"
             else []
         ),
         *(
@@ -1600,6 +1683,7 @@ HISTORY_KEYS = (
     "pc_train_acc_step",
     "bp_train_acc_step",
     "pc_energy_step",
+    "pc_act_delta_epoch",
 )
 
 
@@ -1722,6 +1806,15 @@ def _print_eval(
     )
 
 
+def _format_act_deltas(deltas):
+    if deltas is None:
+        return None
+    vals = [float(v) for v in np.asarray(deltas).reshape(-1)]
+    if not vals:
+        return None
+    return " ".join(f"{v:.3g}" for v in vals)
+
+
 def run_benchmark(args, save_dir=None):
     spec = DATASET_SPECS[args.dataset]
     if not hasattr(args, "skip_bp"):
@@ -1732,6 +1825,7 @@ def run_benchmark(args, save_dir=None):
     nan_metrics = (float("nan"), float("nan"))
     set_seed(args.seed)
     key = jr.PRNGKey(args.seed)
+    args._infer_spatial_lr_banner = False
 
     if args.arch == "mlp":
         depth = args.n_hidden + 1
@@ -1795,11 +1889,48 @@ def run_benchmark(args, save_dir=None):
 
     pc_model, bp_model, skip_model = make_models(key, args, spec)
     if args.arch == "cnn":
-        hidden_energy_scaling = cnn_pc.cnn_hidden_energy_scales(
+        hidden_fn = (
+            cnn_pc.cnn_hidden_energy_scales_collapsed
+            if getattr(args, "collapse_pools", False)
+            else cnn_pc.cnn_hidden_energy_scales
+        )
+        hidden_energy_scaling = hidden_fn(
             pc_model,
             hidden_kappa,
             getattr(args, "hidden_energy_layers", "weight"),
         )
+        if getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean":
+            spatial_hw = cnn_pc.hidden_spatial_hw(
+                pc_model,
+                spec["in_channels"],
+                spec["input_size"],
+                bool(getattr(args, "collapse_pools", False)),
+            )
+            if int(spatial_hw.shape[0]) != int(hidden_energy_scaling.shape[0]):
+                raise ValueError(
+                    "Spatial H*W length does not match hidden κ "
+                    f"({spatial_hw.shape[0]} vs {hidden_energy_scaling.shape[0]})."
+                )
+            hw_r = cnn_pc.readout_spatial_hw(pc_model, args.width)
+            args._readout_spatial_hw = hw_r
+            # Every hidden map, including a free pool, uses the scalar κ.
+            # --hidden_energy_layers only applies to the summed energy.
+            if float(jnp.max(jnp.abs(hidden_energy_scaling - hidden_kappa))) > 0:
+                print(
+                    "  spatial_mean applies κ on every hidden map, "
+                    "including free pools; --hidden_energy_layers is not used."
+                )
+            hidden_energy_scaling = hidden_kappa * (hw_r / spatial_hw)
+            if args.param_type == "mupc":
+                output_energy_scaling = output_energy_scaling * hw_r
+            print(
+                f"  readout spatial HW_r={hw_r:g}; "
+                "κ_ℓ = κ * HW_r / HW: "
+                + " ".join(
+                    f"{float(k):.4g} (HW={float(h):.0f})"
+                    for k, h in zip(hidden_energy_scaling, spatial_hw)
+                )
+            )
     else:
         hidden_energy_scaling = hidden_kappa
     if not args.skip_pc:
@@ -1835,6 +1966,12 @@ def run_benchmark(args, save_dir=None):
     if args.skip_bp:
         skip_notes.append("skip_bp")
     skip_note = f", {', '.join(skip_notes)}" if skip_notes else ""
+    if args.param_optim in ("gd", "sgd_momentum"):
+        lr_bp_show = bp_gd_style_lr(
+            args, fan_in=_bp_readout_fan_in(args, bp_model)
+        )
+    else:
+        lr_bp_show = args.param_lr
     print(
         f"Benchmark {args.dataset} ({args.arch}), width={args.width}, "
         f"{_cnn_depth_title(fwd_depth, energy_depth) if args.arch == 'cnn' else f'L={depth}'}, "
@@ -1842,11 +1979,14 @@ def run_benchmark(args, save_dir=None):
         f"κ={hidden_kappa}, "
         + (
             f"hidden_energy_layers={getattr(args, 'hidden_energy_layers', 'weight')}, "
+            f"collapse_pools={getattr(args, 'collapse_pools', False)}, "
+            f"hidden_energy_reduce={getattr(args, 'hidden_energy_reduce', 'sum')}, "
+            f"infer_spatial_lr={getattr(args, 'infer_spatial_lr', True)}, "
             if args.arch == "cnn"
             else ""
         )
         + f"optim={args.param_optim}, "
-        f"lr_bp={args.param_lr}, lr_pc={args.param_lr_pc}, "
+        f"lr_bp={lr_bp_show}, lr_pc={args.param_lr_pc}, "
         f"pc_infer={getattr(args, 'pc_infer_mode', 'infer')}{skip_note}"
     )
     if uses_fixed_subset(args):
@@ -1881,6 +2021,7 @@ def run_benchmark(args, save_dir=None):
         "pc_train_acc_step": [],
         "bp_train_acc_step": [],
         "pc_energy_step": [],
+        "pc_act_delta_epoch": [],
     }
 
     print("Evaluating at initialization...")
@@ -1954,6 +2095,10 @@ def run_benchmark(args, save_dir=None):
         mini_pc_acc_sum = mini_bp_acc_sum = 0.0
         n_batches = 0
         mini_n = 0
+        epoch_delta_sum = None
+        epoch_delta_n = 0
+        mini_delta_sum = None
+        mini_delta_n = 0
 
         for x, y in iter_train_batches(args, epoch):
             if not args.skip_bp:
@@ -1965,7 +2110,7 @@ def run_benchmark(args, save_dir=None):
                 pc_loss, pc_acc = pc_batch_metrics(
                     pc_model, x, y, skip_model, jpc_kw, args.loss_id
                 )
-                pc_model, skip_model, pc_opt_state, energy, pc_ok = (
+                pc_model, skip_model, pc_opt_state, energy, pc_ok, act_deltas = (
                     pc_infer_and_update(
                         pc_model,
                         skip_model,
@@ -1980,6 +2125,15 @@ def run_benchmark(args, save_dir=None):
                         hidden_energy_scaling,
                     )
                 )
+                if act_deltas is not None:
+                    delta_arr = np.asarray(act_deltas, dtype=np.float64)
+                    if epoch_delta_sum is None:
+                        epoch_delta_sum = np.zeros_like(delta_arr)
+                        mini_delta_sum = np.zeros_like(delta_arr)
+                    epoch_delta_sum += delta_arr
+                    mini_delta_sum += delta_arr
+                    epoch_delta_n += 1
+                    mini_delta_n += 1
                 if not pc_ok:
                     print(
                         f"  Warning: non-finite PC energy at epoch {epoch} "
@@ -2106,6 +2260,17 @@ def run_benchmark(args, save_dir=None):
                         bp_test=bp_test,
                         **point_kw,
                     )
+                    mean_delta = (
+                        (epoch_delta_sum / epoch_delta_n).tolist()
+                        if epoch_delta_sum is not None and epoch_delta_n
+                        else None
+                    )
+                    history["pc_act_delta_epoch"].append(
+                        mean_delta if mean_delta is not None else []
+                    )
+                    delta_txt = _format_act_deltas(mean_delta)
+                    if delta_txt:
+                        print(f"    Δz rms: {delta_txt}")
                 else:
                     _print_eval(
                         f"mini-epoch {frac:.1f}",
@@ -2115,9 +2280,18 @@ def run_benchmark(args, save_dir=None):
                         bp_test=bp_test,
                         **point_kw,
                     )
+                    if mini_delta_sum is not None and mini_delta_n:
+                        delta_txt = _format_act_deltas(
+                            mini_delta_sum / mini_delta_n
+                        )
+                        if delta_txt:
+                            print(f"    Δz rms: {delta_txt}")
                 mini_pc_loss_sum = mini_bp_loss_sum = 0.0
                 mini_pc_acc_sum = mini_bp_acc_sum = 0.0
                 mini_n = 0
+                if mini_delta_sum is not None:
+                    mini_delta_sum[:] = 0
+                    mini_delta_n = 0
 
         if n_batches == 0:
             raise RuntimeError(
@@ -2197,6 +2371,17 @@ def run_benchmark(args, save_dir=None):
                 bp_test=bp_test,
                 **point_kw,
             )
+            mean_delta = (
+                (epoch_delta_sum / epoch_delta_n).tolist()
+                if epoch_delta_sum is not None and epoch_delta_n
+                else None
+            )
+            history["pc_act_delta_epoch"].append(
+                mean_delta if mean_delta is not None else []
+            )
+            delta_txt = _format_act_deltas(mean_delta)
+            if delta_txt:
+                print(f"    Δz rms: {delta_txt}")
 
         save_history(history, save_dir)
         plot_metrics(
@@ -2320,6 +2505,44 @@ def parse_args():
             "weight (default): stems + residual blocks; pools unscaled. "
             "all: every hidden module including pools. "
             "residual: ResNetBlocks only. Ignored for MLP."
+        ),
+    )
+    parser.add_argument(
+        "--collapse_pools",
+        action="store_true",
+        default=False,
+        help=(
+            "CNN only: fold AvgPool into the next weight layer in the PC "
+            "energy so pools are not free activities. Ignored for MLP."
+        ),
+    )
+    parser.add_argument(
+        "--hidden_energy_reduce",
+        type=str,
+        default="sum",
+        choices=["sum", "spatial_mean"],
+        help=(
+            "CNN only: how hidden prediction errors enter the energy. "
+            "sum (default): (κ/2) Σ_{c,h,w} e², with --hidden_energy_layers "
+            "choosing which maps get κ. spatial_mean: MLP match on the "
+            "convolutional readout, λ = γ² N L (H_r W_r) and "
+            "κ_ℓ = L (H_r W_r) / (H_ℓ W_ℓ) on every hidden map, including "
+            "free pools. The readout scale is 1/(γ N H_r W_r), so λ times "
+            "that scale is γ L. H_r W_r is the spatial size inside the "
+            "readout fan-in. Ignored for MLP."
+        ),
+    )
+    parser.add_argument(
+        "--infer_spatial_lr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "CNN only, with --hidden_energy_reduce spatial_mean: multiply "
+            "hidden map ℓ's activity gradient by (H_ℓ W_ℓ) / (H_r W_r). "
+            "Together with κ_ℓ = L (H_r W_r) / (H_ℓ W_ℓ) this leaves "
+            "effective spring L, so one step copies a fraction "
+            "activity_lr * L. Default: on. Ignored for MLP and when "
+            "hidden energy is summed."
         ),
     )
     parser.add_argument(
@@ -2879,10 +3102,14 @@ def _fixed_training_args(args):
                 "resnet_fwd_l",
                 "resnet_energy_l",
                 "hidden_energy_layers",
+                "hidden_energy_reduce",
+                "collapse_pools",
             ]
         )
         if getattr(args, "additive_depth_factor", None) is not None:
             keys.append("additive_depth_factor")
+        if getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean":
+            keys.append("infer_spatial_lr")
     fixed = {}
     for key in keys:
         value = getattr(args, key)
@@ -3171,7 +3398,11 @@ if __name__ == "__main__":
 # python train_benchmark.py --dataset Fashion-MNIST --n_epochs 10 --batch_size 128 --width 256 --n_hidden 2 --param_lr 0.3 --param_lr_pc 0.3 --activity_lr 0.001 --n_infer_iters 20 --param_optim adam --act_fn relu --n_seeds 3 --results_dir results_fashion_mnist
 
 # # CNN, CIFAR-10
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 256 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.01 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --results_dir results_cifar
+# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 100 --param_optim sgd_momentum --act_fn relu --hidden_energy_reduce spatial_mean --results_dir results_cifar
+
+# # CNN, CIFAR-10: fold pools out of the PC graph
+# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.005 --n_infer_iters 100 --param_optim sgd_momentum --act_fn relu --hidden_energy_reduce spatial_mean --collapse_pools --results_dir results_cifar_collapse
+
 
 # # CNN L / κ variants (defaults: --resnet_fwd_l n_res_blocks, --resnet_energy_l n_weight_layers, --hidden_energy_layers weight)
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers weight --results_dir results_cifar_l_default

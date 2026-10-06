@@ -158,7 +158,8 @@ class ResNet(eqx.Module):
         out_features: int = 10,
         act_fn: str = "linear",
         scale_non_res_layers: bool = False,
-        additive_depth_factor: int = 0
+        additive_depth_factor: int = 0,
+        gamma: float = 1.0,
     ):
         # 3 stages, each with n_blocks_per_stage residual blocks
         assert n_res_blocks % 3 == 0
@@ -280,16 +281,24 @@ class ResNet(eqx.Module):
             key_idx += 1
         self.layers.append(nn.AvgPool2d(kernel_size=2, stride=2))
 
-        # Readout
+        # Readout. µP fan-in is N H_r W_r, then 1/γ, matching the MLP's
+        # last-layer scale 1/(γ N). λ carries γ², so λ times this scale is γ L
+        # once λ also includes H_r W_r.
         num_pools = 3
         spatial_side = input_size // (2 ** num_pools)
         in_features = width * spatial_side * spatial_side
+        if gamma <= 0.0:
+            raise ValueError(f"gamma must be positive, got {gamma}.")
+        if param_type == "mupc":
+            readout_scaling = non_res_depth_scaling / (gamma * in_features)
+        else:
+            readout_scaling = 1.0 / gamma
         self.layers.append(
             Readout(
                 key=keys[key_idx],
                 in_features=in_features,
                 out_features=out_features,
-                scaling=non_res_depth_scaling / (in_features) if param_type == "mupc" else 1.0,
+                scaling=readout_scaling,
                 param_type=param_type,
                 use_bias=use_bias,
                 weight_std_scale=1/non_res_depth_scaling
