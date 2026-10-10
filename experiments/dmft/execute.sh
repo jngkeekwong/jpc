@@ -31,10 +31,9 @@ source activate $DATA/envs/PC_dmft_env
 cd $DATA
 cd ./jpc/experiments/dmft
 
-
 # 0 = train into the short --results_dir (e.g., results_D)
 # 1 = replot from the saved paper runs (e.g., results/results_convergence/results_D)
-REPLOT=1
+REPLOT=0
 
 python() {
   if [[ "$REPLOT" != 1 ]]; then
@@ -184,3 +183,14 @@ python() {
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 1.0 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_modules --hidden_energy_layers all --results_dir results_cifar_l_modules_lr1
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 1.0 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers residual --results_dir results_cifar_l_res_lr1
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 1.0 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --additive_depth_factor 4 --results_dir results_cifar_l_energy_r_plus_4_lr1
+
+# CNN, CIFAR-10: the PC recipe that matches Adam backprop at 100 epochs.
+# Submitted as task 4 of submit_adam_runs.sh (log/9027714_4.out).
+# python train_benchmark.py --dataset CIFAR10 --arch cnn --width 128 --n_res_blocks 3 \
+#   --batch_size 64 --param_optim adam --act_fn relu \
+#   --hidden_energy_reduce spatial_mean --n_epochs 100 --n_mini_per_epoch 1 \
+#   --n_seeds 1 --skip_bp --activity_update downward --activity_lr 0.01 \
+#   --n_infer_iters 16 --hidden_kappa_ratio 4 --pool_activity_lr_mult 0.25 \
+#   --top_activity_lr_mult 0.05 --top_kappa_mult 4 --adam_kernel_fan_in \
+#   --pc_delta_activities --param_lr 0.3 --param_lr_pc 0.3 \
+#   --results_dir results_cifar_adam_e100/kr4_pool025

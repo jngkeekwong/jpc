@@ -19,7 +19,9 @@ matches the MLP on a convolutional readout: ``λ = γ² N L (H_r W_r)`` and
 The readout multiplies by ``1/(γ N H_r W_r)``, so ``λ`` times that scale is
 ``γ L``, the same cancellation as the MLP's ``λ · 1/(γ N)``. The activity
 step multiplies map ``ℓ`` by ``(H_ℓ W_ℓ) / (H_r W_r)``, so the effective
-spring stays ``L``.
+spring stays ``L``. ``update_pc_activities`` steps every free map from the
+same activities. ``update_pc_activities_downward`` takes that same step one
+map at a time, from the readout end down to the first convolution.
 """
 
 from __future__ import annotations
@@ -237,17 +239,18 @@ def activity_hw(activity) -> float:
 def readout_spatial_hw(model, width: int) -> float:
     """``H_r W_r`` inside the readout fan-in, not the last free map.
 
-    The linear layer sees ``width * H_r * W_r`` features. For CIFAR-10 with
-    three pools that is the ``4×4`` map, 16, even when a pool is folded and
-    the last free activity is ``8×8``.
+    The linear layer sees ``width * H_r * W_r`` features.
+    For the CIFAR ResNet with three pools that is the ``4×4`` map, 16, even
+    when a pool is folded and the last free activity is ``8×8``.
     """
     in_features = int(model.layers[-1].linear.weight.shape[-1])
-    width = int(width)
-    if width < 1 or in_features % width != 0:
+    channels = int(width)
+    if channels < 1 or in_features % channels != 0:
         raise ValueError(
-            f"Readout fan-in {in_features} is not divisible by width {width}."
+            f"Readout fan-in {in_features} is not divisible by channel count "
+            f"{channels}."
         )
-    hw = in_features // width
+    hw = in_features // channels
     if hw < 1:
         raise ValueError(f"Readout spatial size must be positive, got {hw}.")
     return float(hw)
@@ -417,6 +420,80 @@ def pc_energy_fn_collapse_pools(
     return jnp.sum(jnp.stack(energies)) / y.shape[0]
 
 
+def _relu_diff(a, d):
+    """``relu(a + d) - relu(a)`` without cancellation when ``|d| << |a|``."""
+    return jnp.where(a > 0, jnp.maximum(d, -a), jnp.maximum(a + d, 0.0))
+
+
+def _layer_diff(layer, z0, d):
+    """``layer(z0 + d) - layer(z0)`` for one sample, computed on ``d`` directly.
+
+    Convs, pools and the readout are linear, so their JVP is the exact
+    difference. A ReLU residual block is ``d + conv(relu(z0 + d) - relu(z0))``.
+    """
+    if isinstance(layer, ResNetBlock):
+        if layer.act_fn is not jax.nn.relu:
+            raise ValueError("--pc_delta_activities supports ReLU residual blocks only.")
+        u = _relu_diff(z0, d)
+        return d + jax.jvp(layer.scaled_conv, (jax.nn.relu(z0),), (u,))[1]
+    return jax.jvp(layer, (z0,), (d,))[1]
+
+
+def pc_energy_fn_delta(
+    params,
+    deltas,
+    y,
+    *,
+    base,
+    x,
+    loss="mse",
+    output_energy_scaling=None,
+    hidden_energy_scaling=None,
+    with_param_grads=False,
+) -> Scalar:
+    """``pc_energy_fn_layered`` at ``z = base + deltas``, with ``base`` the
+    feedforward pass of the current weights.
+
+    Since ``base_ℓ = f_ℓ(base_{ℓ-1})``, the error is
+    ``e_ℓ = δ_ℓ - [f_ℓ(base_{ℓ-1} + δ_{ℓ-1}) - f_ℓ(base_{ℓ-1})]``. Low maps move
+    by ~1e-7 of their size, below float32 resolution of ``z``, so both the
+    stored state and the error are kept in this displacement form.
+
+    With ``with_param_grads`` the weight gradient is that of the standard
+    energy at ``z`` (``-κ e ∂f(z_{ℓ-1})/∂W``) and the error value is unchanged.
+    """
+    model, skip_model = params
+    if skip_model is not None and any(s is not None for s in skip_model):
+        raise ValueError("--pc_delta_activities does not support skip models.")
+    n_hidden = len(model) - 1
+    output_scale = 1.0 if output_energy_scaling is None else output_energy_scaling
+    hidden_scales = _as_hidden_scales(hidden_energy_scaling, n_hidden)
+    model_sg = jax.tree_util.tree_map(
+        lambda a: jax.lax.stop_gradient(a) if eqx.is_array(a) else a, model
+    )
+
+    errs = [deltas[0]]
+    for l in range(1, n_hidden):
+        diff = vmap(lambda z0, d: _layer_diff(model_sg[l], z0, d))(
+            base[l - 1], deltas[l - 1]
+        )
+        errs.append(deltas[l] - diff)
+
+    if with_param_grads:
+        prev = [x] + [jax.lax.stop_gradient(b + d) for b, d in zip(base, deltas)]
+        for l in range(n_hidden):
+            pred = vmap(model[l])(prev[l])
+            errs[l] = jax.lax.stop_gradient(errs[l]) - (
+                pred - jax.lax.stop_gradient(pred)
+            )
+
+    logits = vmap(model[-1])(base[-2] + deltas[-2])
+    energies = [_output_energy(loss, output_scale, logits, y)]
+    for l, err in enumerate(errs):
+        energies.append(0.5 * hidden_scales[l] * jnp.sum(err ** 2))
+    return jnp.sum(jnp.stack(energies)) / y.shape[0]
+
+
 def pc_energy_fn(
     params,
     activities,
@@ -427,7 +504,25 @@ def pc_energy_fn(
     output_energy_scaling=None,
     hidden_energy_scaling=None,
     collapse_pools=False,
+    base=None,
+    with_param_grads=False,
 ):
+    """``base`` given: ``activities`` are displacements from it (see
+    ``pc_energy_fn_delta``)."""
+    if base is not None:
+        if collapse_pools:
+            raise ValueError("--pc_delta_activities does not support collapsed pools.")
+        return pc_energy_fn_delta(
+            params,
+            activities,
+            y,
+            base=base,
+            x=x,
+            loss=loss,
+            output_energy_scaling=output_energy_scaling,
+            hidden_energy_scaling=hidden_energy_scaling,
+            with_param_grads=with_param_grads,
+        )
     if collapse_pools:
         return pc_energy_fn_collapse_pools(
             params,
@@ -471,6 +566,7 @@ def update_pc_activities(
     hidden_energy_scaling=None,
     collapse_pools=False,
     activity_grad_scales=None,
+    base=None,
 ):
     """One local activity step on every free activity."""
     energy, grads = jax.value_and_grad(pc_energy_fn, argnums=1)(
@@ -482,6 +578,7 @@ def update_pc_activities(
         output_energy_scaling=output_energy_scaling,
         hidden_energy_scaling=hidden_energy_scaling,
         collapse_pools=collapse_pools,
+        base=base,
     )
     if activity_grad_scales is not None:
         scales = jnp.asarray(activity_grad_scales, dtype=jnp.float32)
@@ -494,6 +591,85 @@ def update_pc_activities(
         params=activities,
     )
     activities = eqx.apply_updates(model=activities, updates=updates)
+    return {
+        "energy": energy,
+        "activities": activities,
+        "grads": grads,
+        "opt_state": opt_state,
+    }
+
+
+def _mask_activity_grads(grads, index, activity_grad_scales):
+    """Keep one activity gradient and zero the rest.
+
+    ``index`` is a Python int. The output activity is never selected: the
+    loss depends on the readout of the last hidden map, not on that entry.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(grads)
+    scales = (
+        None
+        if activity_grad_scales is None
+        else jnp.asarray(activity_grad_scales, dtype=jnp.float32)
+    )
+    masked = []
+    for j, grad in enumerate(leaves):
+        if j != index:
+            masked.append(jnp.zeros_like(grad))
+        elif scales is None:
+            masked.append(grad)
+        else:
+            masked.append(grad * scales[j])
+    return jax.tree_util.tree_unflatten(treedef, masked)
+
+
+@eqx.filter_jit
+def update_pc_activities_downward(
+    params,
+    activities,
+    optim,
+    opt_state,
+    output,
+    *,
+    input=None,
+    loss_id="mse",
+    output_energy_scaling=None,
+    hidden_energy_scaling=None,
+    collapse_pools=False,
+    activity_grad_scales=None,
+    base=None,
+):
+    """One downward sweep of local activity steps, from the top hidden map.
+
+    Each step is the same gradient as ``update_pc_activities``, restricted
+    to one map. The map below is differentiated after the map above has
+    moved. The final entry (logits) is left unchanged.
+    """
+
+    def energy_of(acts):
+        return pc_energy_fn(
+            params,
+            acts,
+            output,
+            x=input,
+            loss=loss_id,
+            output_energy_scaling=output_energy_scaling,
+            hidden_energy_scaling=hidden_energy_scaling,
+            collapse_pools=collapse_pools,
+            base=base,
+        )
+
+    energy = None
+    grads = None
+    # Last entry is the output activity. CE and MSE both read activities[-2].
+    for index in range(len(activities) - 2, -1, -1):
+        energy, grads = jax.value_and_grad(energy_of)(activities)
+        grads = _mask_activity_grads(grads, index, activity_grad_scales)
+        updates, opt_state = optim.update(
+            updates=grads,
+            state=opt_state,
+            params=activities,
+        )
+        activities = eqx.apply_updates(model=activities, updates=updates)
     return {
         "energy": energy,
         "activities": activities,
@@ -515,6 +691,7 @@ def update_pc_params(
     output_energy_scaling=None,
     hidden_energy_scaling=None,
     collapse_pools=False,
+    base=None,
 ):
     grads = eqx.filter_grad(pc_energy_fn)(
         params,
@@ -525,6 +702,8 @@ def update_pc_params(
         output_energy_scaling=output_energy_scaling,
         hidden_energy_scaling=hidden_energy_scaling,
         collapse_pools=collapse_pools,
+        base=base,
+        with_param_grads=True,
     )
     updates, opt_state = optim.update(
         updates=grads,

@@ -49,7 +49,10 @@ hidden map, including free pools. ``--infer_spatial_lr`` (default on)
 multiplies map ``ℓ``'s activity gradient by ``(H_ℓ W_ℓ) / (H_r W_r)``,
 so one local step still copies a fraction ``activity_lr · L``. ``β`` and
 ``η`` stay the MLP values. The readout multiplies by ``1/(γ N H_r W_r)``.
-Inference is K steps of that gradient on every free activity.
+``--activity_update parallel`` (default) takes K steps of that gradient
+on every free activity at once. ``--activity_update downward`` (CNN only)
+takes K sweeps, each one local step from the top hidden map down to the
+first. The MLP always uses the parallel ``jpc`` update.
 
 For Adam, the PC parameter LR is divided the same way as BP
 (``1/√N``, or ``1/√(N L)`` with MLP skips). GD and SGD+momentum keep the
@@ -188,6 +191,11 @@ def default_arch_for_dataset(dataset_id):
     return "mlp" if dataset_id in MLP_DATASETS else "cnn"
 
 
+def uses_conv_pc(args) -> bool:
+    """The ResNet uses the convolutional PC energy and activity updates."""
+    return getattr(args, "arch", None) == "cnn"
+
+
 def cnn_energy_depth(n_res_blocks, additive_depth_factor):
     """Energy depth ``L = n_res_blocks + additive_depth_factor``.
 
@@ -242,7 +250,9 @@ def make_sgd_param_optim(learning_rate, args):
 def supervised_loss(preds, y, loss_id):
     if loss_id == "mse":
         return jpc.mse_loss(preds, y)
-    return jpc.cross_entropy_loss(preds, y)
+    # jpc.cross_entropy_loss takes log(softmax), which is 0 * -inf = nan (in
+    # value and gradient) once a class probability underflows.
+    return -jnp.mean(jnp.sum(y * jax.nn.log_softmax(preds, axis=-1), axis=-1))
 
 
 def accuracy_pct(preds, y):
@@ -731,9 +741,96 @@ def pc_jpc_kwargs(args):
     CNN µP lives inside ``ResNet``; passing ``param_type='mupc'`` would apply
     extra MLP scalings (and index ``Linear`` weights that do not exist).
     """
-    if args.arch == "cnn":
+    if uses_conv_pc(args):
         return dict(param_type="sp", gamma=None)
     return dict(param_type=args.param_type, gamma=args.gamma)
+
+
+def _scale_hidden_layer_updates(mult):
+    """Multiply the gradient of every CNN layer except the readout by ``mult``."""
+
+    def init_fn(params):
+        del params
+        return optax.EmptyState()
+
+    def update_fn(updates, state, params=None):
+        del params
+        model_u, skip_u = updates
+        n = len(model_u.layers)
+        layers = [
+            layer if i == n - 1 else jax.tree_util.tree_map(lambda g: g * mult, layer)
+            for i, layer in enumerate(model_u.layers)
+        ]
+        model_u = eqx.tree_at(lambda m: m.layers, model_u, layers)
+        return (model_u, skip_u), state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _kernel_fan_in_adam_scale():
+    """Divide stage- and residual-conv Adam updates by the kernel size k.
+
+    ``configure_cnn_param_optim`` scales conv LRs by ``1/√N``; µP with Adam
+    uses ``1/√fan_in`` with ``fan_in = N k²``. The first conv and the readout
+    are unchanged. Works on a bare ResNet tree (BP) or ``(model, skip)`` (PC).
+    """
+
+    def init_fn(params):
+        del params
+        return optax.EmptyState()
+
+    def scale_model(model_u):
+        n = len(model_u.layers)
+        layers = []
+        for i, layer in enumerate(model_u.layers):
+            weights = [
+                w for w in jax.tree_util.tree_leaves(eqx.filter(layer, eqx.is_array))
+                if w.ndim == 4
+            ]
+            if 0 < i < n - 1 and weights:
+                k = weights[0].shape[-1]
+                layer = jax.tree_util.tree_map(lambda u: u / k, layer)
+            layers.append(layer)
+        return eqx.tree_at(lambda m: m.layers, model_u, layers)
+
+    def update_fn(updates, state, params=None):
+        del params
+        if isinstance(updates, tuple):
+            model_u, skip_u = updates
+            return (scale_model(model_u), skip_u), state
+        return scale_model(updates), state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _layerwise_trust_ratio():
+    """Rescale each weight array's update to that array's norm (LARS ratio).
+
+    With this first in the chain, ``param_lr_pc`` is the per-step size of
+    every layer's update relative to its weights, before momentum.
+    """
+
+    def init_fn(params):
+        del params
+        return optax.EmptyState()
+
+    def update_fn(updates, state, params):
+        arrays = eqx.filter(params, eqx.is_array)
+
+        def scale(g, w):
+            if g is None or w is None:
+                return g
+            g_norm = jnp.linalg.norm(g)
+            w_norm = jnp.linalg.norm(w)
+            ok = (g_norm > 0) & (w_norm > 0)
+            return jnp.where(ok, g * (w_norm / jnp.where(ok, g_norm, 1.0)), g)
+
+        updates = jax.tree_util.tree_map(
+            scale, updates, arrays, is_leaf=lambda v: v is None
+        )
+        return updates, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
 def make_pc_param_optim(pc_model, skip_model, args, depth):
@@ -741,6 +838,13 @@ def make_pc_param_optim(pc_model, skip_model, args, depth):
         if args.param_optim in ("gd", "sgd_momentum"):
             # train.py PC GD: raw LR; width/gamma/depth live in the energy.
             param_optim = make_sgd_param_optim(args.param_lr_pc, args)
+            hidden_mult = float(getattr(args, "pc_hidden_lr_mult", 1.0))
+            if hidden_mult != 1.0:
+                param_optim = optax.chain(
+                    _scale_hidden_layer_updates(hidden_mult), param_optim
+                )
+            if getattr(args, "pc_layerwise_norm", False):
+                param_optim = optax.chain(_layerwise_trust_ratio(), param_optim)
         else:
             param_optim = configure_cnn_param_optim(
                 pc_model,
@@ -752,6 +856,8 @@ def make_pc_param_optim(pc_model, skip_model, args, depth):
                 gamma_0=args.gamma,
                 params_for_pc=True,
             )
+            if getattr(args, "adam_kernel_fan_in", False):
+                param_optim = optax.chain(param_optim, _kernel_fan_in_adam_scale())
         opt_state = param_optim.init(
             (eqx.filter(pc_model, eqx.is_array), skip_model)
         )
@@ -779,14 +885,14 @@ def make_pc_param_optim(pc_model, skip_model, args, depth):
 
 def _bp_readout_fan_in(args, model):
     """Units the readout sums over. CNN: ``N H_r W_r``. MLP: ``N``."""
-    if args.arch == "cnn" and args.param_type != "sp":
+    if uses_conv_pc(args) and args.param_type != "sp":
         return int(model.layers[-1].linear.weight.shape[-1])
     return args.width
 
 
 def make_bp_param_optim(bp_model, args, depth):
     if args.param_optim in ("gd", "sgd_momentum") and (
-        args.arch == "cnn" or args.param_optim == "sgd_momentum"
+        uses_conv_pc(args) or args.param_optim == "sgd_momentum"
     ):
         fan_in = _bp_readout_fan_in(args, bp_model)
         optim = make_sgd_param_optim(bp_gd_style_lr(args, fan_in=fan_in), args)
@@ -803,6 +909,8 @@ def make_bp_param_optim(bp_model, args, depth):
             gamma_0=args.gamma,
             params_for_pc=False,
         )
+        if args.param_optim == "adam" and getattr(args, "adam_kernel_fan_in", False):
+            optim = optax.chain(optim, _kernel_fan_in_adam_scale())
         return optim, optim.init(eqx.filter(bp_model, eqx.is_array))
 
     optim = configure_param_optim(
@@ -972,6 +1080,18 @@ def pc_closed_form(args):
     return getattr(args, "pc_infer_mode", "infer") == "closed_form"
 
 
+def pc_delta_enabled(args) -> bool:
+    """``--pc_delta_activities``; unset means on for a ReLU conv net with free pools."""
+    value = getattr(args, "pc_delta_activities", None)
+    if value is None:
+        return (
+            uses_conv_pc(args)
+            and not getattr(args, "collapse_pools", False)
+            and args.act_fn == "relu"
+        )
+    return bool(value)
+
+
 def pc_infer_and_update(
     model,
     skip_model,
@@ -1019,7 +1139,7 @@ def pc_infer_and_update(
 
     activities = (
         cnn_pc.init_activities_collapse_pools(model, x)
-        if args.arch == "cnn" and getattr(args, "collapse_pools", False)
+        if uses_conv_pc(args) and getattr(args, "collapse_pools", False)
         else jpc.init_activities_with_ffwd(
             model=model,
             input=x,
@@ -1027,22 +1147,30 @@ def pc_infer_and_update(
             **jpc_kw,
         )
     )
+    ffwd_base = None
+    if uses_conv_pc(args) and pc_delta_enabled(args):
+        ffwd_base = activities
+        activities = jax.tree_util.tree_map(jnp.zeros_like, ffwd_base)
     init_activities = activities
     activity_opt_state = activity_optim.init(activities)
     energy = None
-    update_activities = (
-        cnn_pc.update_pc_activities
-        if args.arch == "cnn"
-        else jpc.update_pc_activities
-    )
-    update_params = (
-        cnn_pc.update_pc_params if args.arch == "cnn" else jpc.update_pc_params
-    )
-    extra_kw = {} if args.arch == "cnn" else jpc_kw
-    collapse = args.arch == "cnn" and bool(getattr(args, "collapse_pools", False))
-    act_kw = dict(collapse_pools=collapse) if args.arch == "cnn" else {}
     if (
-        args.arch == "cnn"
+        uses_conv_pc(args)
+        and getattr(args, "activity_update", "parallel") == "downward"
+    ):
+        update_activities = cnn_pc.update_pc_activities_downward
+    elif uses_conv_pc(args):
+        update_activities = cnn_pc.update_pc_activities
+    else:
+        update_activities = jpc.update_pc_activities
+    update_params = (
+        cnn_pc.update_pc_params if uses_conv_pc(args) else jpc.update_pc_params
+    )
+    extra_kw = {} if uses_conv_pc(args) else jpc_kw
+    collapse = uses_conv_pc(args) and bool(getattr(args, "collapse_pools", False))
+    act_kw = dict(collapse_pools=collapse) if uses_conv_pc(args) else {}
+    if (
+        uses_conv_pc(args)
         and getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean"
         and bool(getattr(args, "infer_spatial_lr", True))
     ):
@@ -1061,7 +1189,36 @@ def pc_infer_and_update(
             )
             args._infer_spatial_lr_banner = True
         act_kw["activity_grad_scales"] = hw_scales
-    param_kw = dict(collapse_pools=collapse) if args.arch == "cnn" else {}
+    gain = getattr(args, "_kappa_depth_gain", None)
+    if uses_conv_pc(args) and gain is not None:
+        if int(gain.shape[0]) != len(activities) - 1:
+            raise ValueError(
+                f"κ depth gain has {gain.shape[0]} entries for "
+                f"{len(activities) - 1} hidden maps."
+            )
+        base = act_kw.get("activity_grad_scales")
+        if base is None:
+            base = jnp.ones(len(activities), dtype=jnp.float32)
+        act_kw["activity_grad_scales"] = base / jnp.append(gain, 1.0)
+    top_mult = float(getattr(args, "top_activity_lr_mult", 1.0))
+    if uses_conv_pc(args) and top_mult != 1.0:
+        base = act_kw.get("activity_grad_scales")
+        if base is None:
+            base = jnp.ones(len(activities), dtype=jnp.float32)
+        act_kw["activity_grad_scales"] = base.at[len(activities) - 2].multiply(top_mult)
+    pool_mult = float(getattr(args, "pool_activity_lr_mult", 1.0))
+    if uses_conv_pc(args) and pool_mult != 1.0 and not collapse:
+        base = act_kw.get("activity_grad_scales")
+        if base is None:
+            base = jnp.ones(len(activities), dtype=jnp.float32)
+        for i, layer in enumerate(model.layers[: len(activities) - 1]):
+            if not jax.tree_util.tree_leaves(eqx.filter(layer, eqx.is_array)):
+                base = base.at[i].multiply(pool_mult)
+        act_kw["activity_grad_scales"] = base
+    param_kw = dict(collapse_pools=collapse) if uses_conv_pc(args) else {}
+    if ffwd_base is not None:
+        act_kw["base"] = ffwd_base
+        param_kw["base"] = ffwd_base
     for _ in range(args.n_infer_iters):
         result = update_activities(
             params=params,
@@ -1082,15 +1239,20 @@ def pc_infer_and_update(
 
     energy = float(energy)
     deltas = None
-    if args.arch == "cnn":
+    if uses_conv_pc(args):
         deltas = [
             float(v)
             for v in np.asarray(
                 cnn_pc.activity_rms_deltas(activities, init_activities)
             )
         ]
-    if not np.isfinite(energy):
-        return model, skip_model, param_opt_state, energy, False, deltas
+    # ``energy`` is evaluated before the last activity step, so it can be
+    # finite while that step has already produced inf/nan activities.
+    acts_finite = all(
+        bool(jnp.all(jnp.isfinite(a))) for a in jax.tree_util.tree_leaves(activities)
+    )
+    if not np.isfinite(energy) or not acts_finite:
+        return model, skip_model, param_opt_state, float("nan"), False, deltas
 
     param_result = update_params(
         params=params,
@@ -1136,11 +1298,10 @@ def make_bp_step(loss_id):
 
 
 def setup_save_dir(args, seed_tag=None):
-    depth_tag = (
-        f"{args.n_hidden}_n_hidden"
-        if args.arch == "mlp"
-        else f"{args.n_res_blocks}_n_res_blocks"
-    )
+    if args.arch == "mlp":
+        depth_tag = f"{args.n_hidden}_n_hidden"
+    else:
+        depth_tag = f"{args.n_res_blocks}_n_res_blocks"
     if seed_tag is None:
         seed_tag = str(args.seed)
     return os.path.join(
@@ -1189,20 +1350,66 @@ def setup_save_dir(args, seed_tag=None):
         ),
         *(
             [f"{getattr(args, 'hidden_energy_reduce', 'sum')}_hidden_energy_reduce"]
-            if args.arch == "cnn"
+            if uses_conv_pc(args)
             and getattr(args, "hidden_energy_reduce", "sum") != "sum"
             else []
         ),
         *(
             [f"{getattr(args, 'infer_spatial_lr', True)}_infer_spatial_lr"]
-            if args.arch == "cnn"
+            if uses_conv_pc(args)
             and getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean"
+            else []
+        ),
+        *(
+            [f"{getattr(args, 'activity_update', 'parallel')}_activity_update"]
+            if uses_conv_pc(args)
+            and getattr(args, "activity_update", "parallel") != "parallel"
             else []
         ),
         *(
             [f"{args.additive_depth_factor}_additive_depth_factor"]
             if args.arch == "cnn"
             and getattr(args, "additive_depth_factor", None) is not None
+            else []
+        ),
+        *(
+            [f"{args.pc_hidden_lr_mult}_pc_hidden_lr_mult"]
+            if float(getattr(args, "pc_hidden_lr_mult", 1.0)) != 1.0
+            else []
+        ),
+        *(
+            [f"{args.pool_activity_lr_mult}_pool_activity_lr_mult"]
+            if float(getattr(args, "pool_activity_lr_mult", 1.0)) != 1.0
+            else []
+        ),
+        *(
+            ["adam_kernel_fan_in"]
+            if getattr(args, "adam_kernel_fan_in", False)
+            else []
+        ),
+        *(
+            ["pc_delta_activities"]
+            if pc_delta_enabled(args)
+            else []
+        ),
+        *(
+            [f"{args.top_activity_lr_mult}_top_activity_lr_mult"]
+            if float(getattr(args, "top_activity_lr_mult", 1.0)) != 1.0
+            else []
+        ),
+        *(
+            ["pc_layerwise_norm"]
+            if getattr(args, "pc_layerwise_norm", False)
+            else []
+        ),
+        *(
+            [f"{args.hidden_kappa_ratio}_hidden_kappa_ratio"]
+            if float(getattr(args, "hidden_kappa_ratio", 1.0)) != 1.0
+            else []
+        ),
+        *(
+            [f"{args.top_kappa_mult}_top_kappa_mult"]
+            if float(getattr(args, "top_kappa_mult", 1.0)) != 1.0
             else []
         ),
         f"{args.skip_pc}_skip_pc",
@@ -1888,7 +2095,11 @@ def run_benchmark(args, save_dir=None):
     prepare_data(args)
 
     pc_model, bp_model, skip_model = make_models(key, args, spec)
-    if args.arch == "cnn":
+    if uses_conv_pc(args):
+        energy_width = int(args.width)
+        output_energy_scaling = get_output_energy_scaling(
+            args.param_type, args.gamma, energy_width, energy_depth
+        )
         hidden_fn = (
             cnn_pc.cnn_hidden_energy_scales_collapsed
             if getattr(args, "collapse_pools", False)
@@ -1911,7 +2122,7 @@ def run_benchmark(args, save_dir=None):
                     "Spatial H*W length does not match hidden κ "
                     f"({spatial_hw.shape[0]} vs {hidden_energy_scaling.shape[0]})."
                 )
-            hw_r = cnn_pc.readout_spatial_hw(pc_model, args.width)
+            hw_r = cnn_pc.readout_spatial_hw(pc_model, energy_width)
             args._readout_spatial_hw = hw_r
             # Every hidden map, including a free pool, uses the scalar κ.
             # --hidden_energy_layers only applies to the summed energy.
@@ -1930,6 +2141,34 @@ def run_benchmark(args, save_dir=None):
                     f"{float(k):.4g} (HW={float(h):.0f})"
                     for k, h in zip(hidden_energy_scaling, spatial_hw)
                 )
+            )
+        ratio = float(getattr(args, "hidden_kappa_ratio", 1.0))
+        args._kappa_depth_gain = None
+        if ratio != 1.0:
+            n_maps = int(hidden_energy_scaling.shape[0])
+            gain = ratio ** jnp.arange(n_maps - 1, -1, -1, dtype=jnp.float32)
+            hidden_energy_scaling = hidden_energy_scaling * gain
+            args._kappa_depth_gain = gain
+            print(
+                f"  hidden_kappa_ratio={ratio:g}: κ_ℓ × "
+                + " ".join(f"{float(g):.4g}" for g in gain)
+                + " (activity steps divided by the same factors)"
+            )
+        top_kappa = float(getattr(args, "top_kappa_mult", 1.0))
+        if top_kappa != 1.0:
+            # Top map only. λ is unchanged, so this is not an ε change:
+            # equilibrium κ e stays tied to λ ∇CE while e and Δz shrink.
+            hidden_energy_scaling = jnp.asarray(hidden_energy_scaling).at[-1].multiply(
+                top_kappa
+            )
+            gain = args._kappa_depth_gain
+            if gain is None:
+                gain = jnp.ones_like(hidden_energy_scaling)
+            args._kappa_depth_gain = gain.at[-1].multiply(top_kappa)
+            print(
+                f"  top_kappa_mult={top_kappa:g}: top κ "
+                f"{float(hidden_energy_scaling[-1]):.4g}, "
+                "top activity step divided by the same factor"
             )
     else:
         hidden_energy_scaling = hidden_kappa
@@ -1982,7 +2221,8 @@ def run_benchmark(args, save_dir=None):
             f"collapse_pools={getattr(args, 'collapse_pools', False)}, "
             f"hidden_energy_reduce={getattr(args, 'hidden_energy_reduce', 'sum')}, "
             f"infer_spatial_lr={getattr(args, 'infer_spatial_lr', True)}, "
-            if args.arch == "cnn"
+            f"activity_update={getattr(args, 'activity_update', 'parallel')}, "
+            if uses_conv_pc(args)
             else ""
         )
         + f"optim={args.param_optim}, "
@@ -2440,7 +2680,6 @@ def parse_args():
             "tiny-CIFAR10, cnn otherwise."
         ),
     )
-
     parser.add_argument(
         "--width",
         type=int,
@@ -2602,6 +2841,104 @@ def parse_args():
         help="Momentum for --param_optim sgd_momentum (ignored otherwise).",
     )
     parser.add_argument(
+        "--pc_hidden_lr_mult",
+        type=float,
+        default=1.0,
+        help=(
+            "CNN PC with GD / SGD+momentum only: multiply the PC learning "
+            "rate of every layer except the readout. 1 (default) keeps "
+            "BP's per-layer balance, in which hidden features move about "
+            "H_r W_r = 16 times faster per step than the readout moves the "
+            "logits. 1/(H_r W_r) = 0.0625 gives the MLP µP balance "
+            "(hidden-feature change ≈ logit change per step)."
+        ),
+    )
+    parser.add_argument(
+        "--pc_layerwise_norm",
+        action="store_true",
+        help=(
+            "CNN PC with GD / SGD+momentum only: rescale each layer's PC "
+            "gradient to the norm of that layer's weights before momentum "
+            "(LARS trust ratio), so --param_lr_pc is the relative step "
+            "||ΔW||/||W|| of every layer. Finite inference passes a signal "
+            "to each lower map that shrinks by a roughly constant factor "
+            "per map, so lower layers otherwise get orders of magnitude "
+            "smaller gradients. BP's relative step is about 6e-4 (hidden "
+            "convolutions) to 5e-3 (stem) per step. BP is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--pc_delta_activities",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "CNN PC: store each activity as its displacement from the feedforward "
+            "pass and compute prediction errors from the displacements. Same "
+            "energy, steps and weight update; avoids float32 cancellation in "
+            "z - f(z_prev) on low maps, whose errors are ~1e-7 of the activity. "
+            "Free pools only, ReLU. Default: on for a ReLU CNN without "
+            "--collapse_pools; --no-pc_delta_activities restores the plain form."
+        ),
+    )
+    parser.add_argument(
+        "--adam_kernel_fan_in",
+        action="store_true",
+        help=(
+            "CNN with Adam, PC and BP: divide stage- and residual-conv updates "
+            "by the kernel size k, so their LR scales as 1/√(N k²) (µP with the "
+            "conv fan-in) instead of 1/√N. First conv and readout unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--top_activity_lr_mult",
+        type=float,
+        default=1.0,
+        help=(
+            "CNN only: multiply the activity step of the top hidden map (the "
+            "readout input) by this factor. The readout's PC gradient is taken "
+            "at the inferred top activity z + Δz with Δz ∝ W_rᵀ(y - p), which "
+            "adds a term that grows W_r along the output errors; its size is "
+            "proportional to Δz. Lower maps keep --activity_lr."
+        ),
+    )
+    parser.add_argument(
+        "--pool_activity_lr_mult",
+        type=float,
+        default=1.0,
+        help=(
+            "CNN with free pools: multiply the activity step of every pooled "
+            "map. Its curvature is set by the next stage conv, whose spectral "
+            "norm grows during training faster than any other layer's."
+        ),
+    )
+    parser.add_argument(
+        "--hidden_kappa_ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "CNN only: multiply κ_ℓ by ratio**d_ℓ, where d_ℓ is the number of "
+            "hidden maps above map ℓ (top map d=0, so λ and the top κ are "
+            "unchanged), and divide that map's activity step by the same "
+            "factor. One downward sweep then passes a fraction "
+            "ratio / (ratio + ||J||²) of the signal per map instead of "
+            "1 / (1 + ||J||²). Lower prediction errors shrink as ratio**-d, "
+            "so keep ratio**d_max well below 1e5 in float32 "
+            "(e.g. ≤ 4 with 9 free maps, ≤ 8 with collapsed pools)."
+        ),
+    )
+    parser.add_argument(
+        "--top_kappa_mult",
+        type=float,
+        default=1.0,
+        help=(
+            "CNN only: multiply κ of the top hidden map by this factor and "
+            "divide that map's activity step by the same factor. λ is left "
+            "unchanged. At equilibrium κ e stays tied to the output gradient "
+            "while the top displacement Δz shrinks, which is the presynaptic "
+            "shift in the readout and stage-conv updates."
+        ),
+    )
+    parser.add_argument(
         "--param_lr",
         type=float,
         nargs="+",
@@ -2660,13 +2997,26 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--activity_update",
+        type=str,
+        default="parallel",
+        choices=["parallel", "downward"],
+        help=(
+            "CNN activity inference. 'parallel' (default) steps every free "
+            "map from the same activities. 'downward' steps one map at a "
+            "time from the top hidden map to the first, and --n_infer_iters "
+            "is the number of those sweeps. MLP training ignores this flag."
+        ),
+    )
+    parser.add_argument(
         "--n_infer_iters",
         type=int,
         nargs="+",
         default=[10],
         help=(
-            "PC inference steps. Pass multiple values to sweep PC only. "
-            "Unused with --pc_infer_mode closed_form."
+            "PC inference steps. With --activity_update downward, each step "
+            "is one top-to-bottom sweep. Pass multiple values to sweep PC "
+            "only. Unused with --pc_infer_mode closed_form."
         ),
     )
     parser.add_argument(
@@ -2763,7 +3113,7 @@ def shared_sweep_keys(arch):
     keys = ["width"]
     if arch == "mlp":
         keys.append("n_hidden")
-    else:
+    elif arch == "cnn":
         keys.append("n_res_blocks")
     keys.append("batch_size")
     return keys
@@ -3104,12 +3454,29 @@ def _fixed_training_args(args):
                 "hidden_energy_layers",
                 "hidden_energy_reduce",
                 "collapse_pools",
+                "activity_update",
             ]
         )
         if getattr(args, "additive_depth_factor", None) is not None:
             keys.append("additive_depth_factor")
-        if getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean":
-            keys.append("infer_spatial_lr")
+    if uses_conv_pc(args) and getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean":
+        keys.append("infer_spatial_lr")
+    if float(getattr(args, "pc_hidden_lr_mult", 1.0)) != 1.0:
+        keys.append("pc_hidden_lr_mult")
+    if float(getattr(args, "pool_activity_lr_mult", 1.0)) != 1.0:
+        keys.append("pool_activity_lr_mult")
+    if getattr(args, "adam_kernel_fan_in", False):
+        keys.append("adam_kernel_fan_in")
+    if pc_delta_enabled(args):
+        keys.append("pc_delta_activities")
+    if float(getattr(args, "top_activity_lr_mult", 1.0)) != 1.0:
+        keys.append("top_activity_lr_mult")
+    if getattr(args, "pc_layerwise_norm", False):
+        keys.append("pc_layerwise_norm")
+    if float(getattr(args, "hidden_kappa_ratio", 1.0)) != 1.0:
+        keys.append("hidden_kappa_ratio")
+    if float(getattr(args, "top_kappa_mult", 1.0)) != 1.0:
+        keys.append("top_kappa_mult")
     fixed = {}
     for key in keys:
         value = getattr(args, key)
@@ -3360,6 +3727,33 @@ if __name__ == "__main__":
         raise SystemExit("--n_seeds must be >= 1")
     if args.n_mini_per_epoch < 1:
         raise SystemExit("--n_mini_per_epoch must be >= 1")
+    if args.activity_update == "downward" and not uses_conv_pc(args):
+        raise SystemExit(
+            "--activity_update downward is implemented for --arch cnn only."
+        )
+    if (
+        args.pc_layerwise_norm
+        or args.hidden_kappa_ratio != 1.0
+        or args.top_kappa_mult != 1.0
+        or args.top_activity_lr_mult != 1.0
+        or args.pool_activity_lr_mult != 1.0
+        or args.adam_kernel_fan_in
+    ) and not uses_conv_pc(args):
+        raise SystemExit(
+            "--pc_layerwise_norm / --hidden_kappa_ratio / --top_kappa_mult / "
+            "--top_activity_lr_mult / --pool_activity_lr_mult / "
+            "--adam_kernel_fan_in are for --arch cnn."
+        )
+    args.pc_delta_activities = pc_delta_enabled(args)
+    if args.pc_delta_activities and (
+        not uses_conv_pc(args) or args.collapse_pools or args.act_fn != "relu"
+    ):
+        raise SystemExit(
+            "--pc_delta_activities needs a ReLU --arch cnn without "
+            "--collapse_pools."
+        )
+    if args.pc_layerwise_norm and args.param_optim not in ("gd", "sgd_momentum"):
+        raise SystemExit("--pc_layerwise_norm needs --param_optim gd or sgd_momentum.")
     if args.skip_pc and args.skip_bp:
         raise SystemExit("Cannot use --skip_pc and --skip_bp together")
     if args.pc_infer_mode == "closed_form":
