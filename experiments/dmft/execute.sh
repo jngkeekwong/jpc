@@ -26,6 +26,8 @@
 # Specifying virtual envs
 module load Anaconda3
 source activate $DATA/envs/PC_dmft_env
+# Skip a hard failure when cuDNN autotune cannot profile an engine.
+export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_gpu_strict_conv_algorithm_picker=false"
 
 # run the application
 cd $DATA
@@ -165,32 +167,26 @@ python() {
 ############# CNN ##############
 #################################
 
-# # CNN, CIFAR-10
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 100 --param_optim sgd_momentum --act_fn relu --hidden_energy_reduce spatial_mean --results_dir results_cifar
+# CIFAR-10 recipe. These are also the defaults for --arch cnn:
+# spatial-mean, downward sweeps, delta activities, Adam 0.3 with kernel
+# fan-in, κ ratio 4, top κ ×50, activity step 0.003, 20 sweeps, 100 epochs.
+# Trains PC and backprop.
+# python train_benchmark.py --dataset CIFAR10 --arch cnn \
+#   --width 128 --n_res_blocks 3 --batch_size 64 \
+#   --n_epochs 100 --n_mini_per_epoch 1 \
+#   --param_optim adam --param_lr 0.3 --param_lr_pc 0.3 --adam_kernel_fan_in \
+#   --hidden_energy_reduce spatial_mean --activity_update downward \
+#   --pc_delta_activities --hidden_kappa_ratio 4 --top_kappa_mult 50 \
+#   --activity_lr 0.003 --n_infer_iters 20 \
+#   --results_dir results_cifar --keep_npy
 
-# # CNN, CIFAR-10: fold pools out of the PC graph
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.005 --n_infer_iters 100 --param_optim sgd_momentum --act_fn relu --hidden_energy_reduce spatial_mean --collapse_pools --results_dir results_cifar_collapse
-
-# CNN L / κ variants (defaults: --resnet_fwd_l n_res_blocks, --resnet_energy_l n_weight_layers, --hidden_energy_layers weight)
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers weight --results_dir results_cifar_l_default
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_weight_layers --resnet_energy_l n_weight_layers --hidden_energy_layers all --results_dir results_cifar_l_old
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_modules --hidden_energy_layers all --results_dir results_cifar_l_modules
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers residual --results_dir results_cifar_l_res
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --additive_depth_factor 4 --results_dir results_cifar_l_energy_r_plus_4
-
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 1.0 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers weight --results_dir results_cifar_l_default_lr1
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 1.0 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_weight_layers --resnet_energy_l n_weight_layers --hidden_energy_layers all --results_dir results_cifar_l_old_lr1
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 1.0 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_modules --hidden_energy_layers all --results_dir results_cifar_l_modules_lr1
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 1.0 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers residual --results_dir results_cifar_l_res_lr1
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 1.0 --activity_lr 0.001 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --additive_depth_factor 4 --results_dir results_cifar_l_energy_r_plus_4_lr1
-
-# CNN, CIFAR-10: the PC recipe that matches Adam backprop at 100 epochs.
-# Submitted as task 4 of submit_adam_runs.sh (log/9027714_4.out).
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --width 128 --n_res_blocks 3 \
-#   --batch_size 64 --param_optim adam --act_fn relu \
-#   --hidden_energy_reduce spatial_mean --n_epochs 100 --n_mini_per_epoch 1 \
-#   --n_seeds 1 --skip_bp --activity_update downward --activity_lr 0.01 \
-#   --n_infer_iters 16 --hidden_kappa_ratio 4 --pool_activity_lr_mult 0.25 \
-#   --top_activity_lr_mult 0.05 --top_kappa_mult 4 --adam_kernel_fan_in \
-#   --pc_delta_activities --param_lr 0.3 --param_lr_pc 0.3 \
-#   --results_dir results_cifar_adam_e100/kr4_pool025
+# Sweep the two κ knobs. One backprop run, then one PC run per pair.
+# python train_benchmark.py --dataset CIFAR10 --arch cnn \
+#   --width 128 --n_res_blocks 3 --batch_size 64 \
+#   --n_epochs 100 --n_mini_per_epoch 1 \
+#   --param_optim adam --param_lr 0.3 --param_lr_pc 0.3 --adam_kernel_fan_in \
+#   --hidden_energy_reduce spatial_mean --activity_update downward \
+#   --pc_delta_activities \
+#   --hidden_kappa_ratio 2 4 --top_kappa_mult 20 50 \
+#   --activity_lr 0.003 --n_infer_iters 20 \
+#   --results_dir results_cifar_kappa_sweep --keep_npy

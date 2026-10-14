@@ -16,11 +16,13 @@ it uses all 10k two-class train images; with it, ``--batch_size`` (even)
 examples, balanced.
 
 If any of ``--n_hidden``, ``--width``, ``--batch_size``, ``--n_res_blocks``,
-``--param_lr``, ``--param_lr_pc``, ``--activity_lr``, or ``--n_infer_iters``
-is given as a list, runs a Cartesian hyperparameter sweep. Backprop and PC
-are trained separately: shared architecture/batch axes apply to both,
-``--param_lr`` is BP-only, and ``--param_lr_pc`` / ``--activity_lr`` /
-``--n_infer_iters`` are PC-only. ``--pc_infer_mode closed_form`` skips
+``--param_lr``, ``--param_lr_pc``, ``--activity_lr``, ``--n_infer_iters``,
+``--hidden_kappa_ratio``, or ``--top_kappa_mult`` is given as a list, runs a
+Cartesian hyperparameter sweep. Backprop and PC are trained separately:
+shared architecture/batch axes apply to both, ``--param_lr`` is BP-only,
+and ``--param_lr_pc`` / ``--activity_lr`` / ``--n_infer_iters`` /
+``--hidden_kappa_ratio`` / ``--top_kappa_mult`` are PC-only. The two κ
+flags are ignored for an MLP. ``--pc_infer_mode closed_form`` skips
 activity GD and updates PC parameters from the linear equilibrium
 energy (requires ``--act_fn linear``, ``--loss_id mse``, and
 ``--arch mlp``). Configs are ranked by mean final test accuracy across
@@ -42,17 +44,22 @@ with a single ``L = n_hidden + 1``. CNNs split this into two depths
 (``--resnet_fwd_l``, ``--resnet_energy_l``; see those flags). Hidden
 precision can be restricted with ``--hidden_energy_layers``.
 ``--collapse_pools`` folds each AvgPool into the next weight layer.
-Without it, pool maps stay free activities. ``--hidden_energy_reduce
-spatial_mean`` matches an MLP readout on this fan-in:
-``λ = γ² N L (H_r W_r)`` and ``κ_ℓ = L (H_r W_r) / (H_ℓ W_ℓ)`` on every
-hidden map, including free pools. ``--infer_spatial_lr`` (default on)
-multiplies map ``ℓ``'s activity gradient by ``(H_ℓ W_ℓ) / (H_r W_r)``,
-so one local step still copies a fraction ``activity_lr · L``. ``β`` and
-``η`` stay the MLP values. The readout multiplies by ``1/(γ N H_r W_r)``.
-``--activity_update parallel`` (default) takes K steps of that gradient
-on every free activity at once. ``--activity_update downward`` (CNN only)
-takes K sweeps, each one local step from the top hidden map down to the
-first. The MLP always uses the parallel ``jpc`` update.
+Without it, pool maps stay free activities. ``--hidden_energy_reduce spatial_mean`` (the CNN default) matches an MLP
+readout on this fan-in: ``λ = γ² N L (H_r W_r)`` and
+``κ_ℓ = L (H_r W_r) / (H_ℓ W_ℓ)`` on every hidden map, including free
+pools. ``--infer_spatial_lr`` (default on) multiplies map ``ℓ``'s activity
+gradient by ``(H_ℓ W_ℓ) / (H_r W_r)``, so one local step still copies a
+fraction ``activity_lr · L``. ``β`` and ``η`` stay the MLP values. The
+readout multiplies by ``1/(γ N H_r W_r)``. ``--activity_update downward``
+(the CNN default) takes K sweeps, each one local step from the top hidden
+map down to the first. ``--activity_update parallel`` steps every free map
+from the same activities. The MLP always uses the parallel ``jpc`` update.
+
+Omitted CNN flags use the CIFAR-10 recipe: spatial-mean energy, downward
+sweeps, delta activities, Adam with ``--adam_kernel_fan_in``, hidden κ
+ratio 4, top κ ×50, activity step 0.003, 20 sweeps, parameter learning
+rate 0.3, 100 epochs, and one evaluation per epoch. MLP defaults are
+unchanged.
 
 For Adam, the PC parameter LR is divided the same way as BP
 (``1/√N``, or ``1/√(N L)`` with MLP skips). GD and SGD+momentum keep the
@@ -746,27 +753,6 @@ def pc_jpc_kwargs(args):
     return dict(param_type=args.param_type, gamma=args.gamma)
 
 
-def _scale_hidden_layer_updates(mult):
-    """Multiply the gradient of every CNN layer except the readout by ``mult``."""
-
-    def init_fn(params):
-        del params
-        return optax.EmptyState()
-
-    def update_fn(updates, state, params=None):
-        del params
-        model_u, skip_u = updates
-        n = len(model_u.layers)
-        layers = [
-            layer if i == n - 1 else jax.tree_util.tree_map(lambda g: g * mult, layer)
-            for i, layer in enumerate(model_u.layers)
-        ]
-        model_u = eqx.tree_at(lambda m: m.layers, model_u, layers)
-        return (model_u, skip_u), state
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
 def _kernel_fan_in_adam_scale():
     """Divide stage- and residual-conv Adam updates by the kernel size k.
 
@@ -803,48 +789,11 @@ def _kernel_fan_in_adam_scale():
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def _layerwise_trust_ratio():
-    """Rescale each weight array's update to that array's norm (LARS ratio).
-
-    With this first in the chain, ``param_lr_pc`` is the per-step size of
-    every layer's update relative to its weights, before momentum.
-    """
-
-    def init_fn(params):
-        del params
-        return optax.EmptyState()
-
-    def update_fn(updates, state, params):
-        arrays = eqx.filter(params, eqx.is_array)
-
-        def scale(g, w):
-            if g is None or w is None:
-                return g
-            g_norm = jnp.linalg.norm(g)
-            w_norm = jnp.linalg.norm(w)
-            ok = (g_norm > 0) & (w_norm > 0)
-            return jnp.where(ok, g * (w_norm / jnp.where(ok, g_norm, 1.0)), g)
-
-        updates = jax.tree_util.tree_map(
-            scale, updates, arrays, is_leaf=lambda v: v is None
-        )
-        return updates, state
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
 def make_pc_param_optim(pc_model, skip_model, args, depth):
     if args.arch == "cnn":
         if args.param_optim in ("gd", "sgd_momentum"):
             # train.py PC GD: raw LR; width/gamma/depth live in the energy.
             param_optim = make_sgd_param_optim(args.param_lr_pc, args)
-            hidden_mult = float(getattr(args, "pc_hidden_lr_mult", 1.0))
-            if hidden_mult != 1.0:
-                param_optim = optax.chain(
-                    _scale_hidden_layer_updates(hidden_mult), param_optim
-                )
-            if getattr(args, "pc_layerwise_norm", False):
-                param_optim = optax.chain(_layerwise_trust_ratio(), param_optim)
         else:
             param_optim = configure_cnn_param_optim(
                 pc_model,
@@ -1200,21 +1149,6 @@ def pc_infer_and_update(
         if base is None:
             base = jnp.ones(len(activities), dtype=jnp.float32)
         act_kw["activity_grad_scales"] = base / jnp.append(gain, 1.0)
-    top_mult = float(getattr(args, "top_activity_lr_mult", 1.0))
-    if uses_conv_pc(args) and top_mult != 1.0:
-        base = act_kw.get("activity_grad_scales")
-        if base is None:
-            base = jnp.ones(len(activities), dtype=jnp.float32)
-        act_kw["activity_grad_scales"] = base.at[len(activities) - 2].multiply(top_mult)
-    pool_mult = float(getattr(args, "pool_activity_lr_mult", 1.0))
-    if uses_conv_pc(args) and pool_mult != 1.0 and not collapse:
-        base = act_kw.get("activity_grad_scales")
-        if base is None:
-            base = jnp.ones(len(activities), dtype=jnp.float32)
-        for i, layer in enumerate(model.layers[: len(activities) - 1]):
-            if not jax.tree_util.tree_leaves(eqx.filter(layer, eqx.is_array)):
-                base = base.at[i].multiply(pool_mult)
-        act_kw["activity_grad_scales"] = base
     param_kw = dict(collapse_pools=collapse) if uses_conv_pc(args) else {}
     if ffwd_base is not None:
         act_kw["base"] = ffwd_base
@@ -1373,16 +1307,6 @@ def setup_save_dir(args, seed_tag=None):
             else []
         ),
         *(
-            [f"{args.pc_hidden_lr_mult}_pc_hidden_lr_mult"]
-            if float(getattr(args, "pc_hidden_lr_mult", 1.0)) != 1.0
-            else []
-        ),
-        *(
-            [f"{args.pool_activity_lr_mult}_pool_activity_lr_mult"]
-            if float(getattr(args, "pool_activity_lr_mult", 1.0)) != 1.0
-            else []
-        ),
-        *(
             ["adam_kernel_fan_in"]
             if getattr(args, "adam_kernel_fan_in", False)
             else []
@@ -1390,16 +1314,6 @@ def setup_save_dir(args, seed_tag=None):
         *(
             ["pc_delta_activities"]
             if pc_delta_enabled(args)
-            else []
-        ),
-        *(
-            [f"{args.top_activity_lr_mult}_top_activity_lr_mult"]
-            if float(getattr(args, "top_activity_lr_mult", 1.0)) != 1.0
-            else []
-        ),
-        *(
-            ["pc_layerwise_norm"]
-            if getattr(args, "pc_layerwise_norm", False)
             else []
         ),
         *(
@@ -2758,17 +2672,17 @@ def parse_args():
     parser.add_argument(
         "--hidden_energy_reduce",
         type=str,
-        default="sum",
+        default="spatial_mean",
         choices=["sum", "spatial_mean"],
         help=(
             "CNN only: how hidden prediction errors enter the energy. "
-            "sum (default): (κ/2) Σ_{c,h,w} e², with --hidden_energy_layers "
-            "choosing which maps get κ. spatial_mean: MLP match on the "
-            "convolutional readout, λ = γ² N L (H_r W_r) and "
-            "κ_ℓ = L (H_r W_r) / (H_ℓ W_ℓ) on every hidden map, including "
-            "free pools. The readout scale is 1/(γ N H_r W_r), so λ times "
-            "that scale is γ L. H_r W_r is the spatial size inside the "
-            "readout fan-in. Ignored for MLP."
+            "spatial_mean (default): MLP match on the convolutional readout, "
+            "λ = γ² N L (H_r W_r) and κ_ℓ = L (H_r W_r) / (H_ℓ W_ℓ) on every "
+            "hidden map, including free pools. sum: (κ/2) Σ_{c,h,w} e², with "
+            "--hidden_energy_layers choosing which maps get κ. The readout "
+            "scale is 1/(γ N H_r W_r), so λ times that scale is γ L. "
+            "H_r W_r is the spatial size inside the readout fan-in. "
+            "Ignored for MLP."
         ),
     )
     parser.add_argument(
@@ -2841,33 +2755,6 @@ def parse_args():
         help="Momentum for --param_optim sgd_momentum (ignored otherwise).",
     )
     parser.add_argument(
-        "--pc_hidden_lr_mult",
-        type=float,
-        default=1.0,
-        help=(
-            "CNN PC with GD / SGD+momentum only: multiply the PC learning "
-            "rate of every layer except the readout. 1 (default) keeps "
-            "BP's per-layer balance, in which hidden features move about "
-            "H_r W_r = 16 times faster per step than the readout moves the "
-            "logits. 1/(H_r W_r) = 0.0625 gives the MLP µP balance "
-            "(hidden-feature change ≈ logit change per step)."
-        ),
-    )
-    parser.add_argument(
-        "--pc_layerwise_norm",
-        action="store_true",
-        help=(
-            "CNN PC with GD / SGD+momentum only: rescale each layer's PC "
-            "gradient to the norm of that layer's weights before momentum "
-            "(LARS trust ratio), so --param_lr_pc is the relative step "
-            "||ΔW||/||W|| of every layer. Finite inference passes a signal "
-            "to each lower map that shrinks by a roughly constant factor "
-            "per map, so lower layers otherwise get orders of magnitude "
-            "smaller gradients. BP's relative step is about 6e-4 (hidden "
-            "convolutions) to 5e-3 (stem) per step. BP is unchanged."
-        ),
-    )
-    parser.add_argument(
         "--pc_delta_activities",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -2882,39 +2769,21 @@ def parse_args():
     )
     parser.add_argument(
         "--adam_kernel_fan_in",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "CNN with Adam, PC and BP: divide stage- and residual-conv updates "
             "by the kernel size k, so their LR scales as 1/√(N k²) (µP with the "
-            "conv fan-in) instead of 1/√N. First conv and readout unchanged."
-        ),
-    )
-    parser.add_argument(
-        "--top_activity_lr_mult",
-        type=float,
-        default=1.0,
-        help=(
-            "CNN only: multiply the activity step of the top hidden map (the "
-            "readout input) by this factor. The readout's PC gradient is taken "
-            "at the inferred top activity z + Δz with Δz ∝ W_rᵀ(y - p), which "
-            "adds a term that grows W_r along the output errors; its size is "
-            "proportional to Δz. Lower maps keep --activity_lr."
-        ),
-    )
-    parser.add_argument(
-        "--pool_activity_lr_mult",
-        type=float,
-        default=1.0,
-        help=(
-            "CNN with free pools: multiply the activity step of every pooled "
-            "map. Its curvature is set by the next stage conv, whose spectral "
-            "norm grows during training faster than any other layer's."
+            "conv fan-in) instead of 1/√N. First conv and readout unchanged. "
+            "Default: on for a CNN, off for an MLP. --no-adam_kernel_fan_in "
+            "turns it off."
         ),
     )
     parser.add_argument(
         "--hidden_kappa_ratio",
         type=float,
-        default=1.0,
+        nargs="+",
+        default=[1.0],
         help=(
             "CNN only: multiply κ_ℓ by ratio**d_ℓ, where d_ℓ is the number of "
             "hidden maps above map ℓ (top map d=0, so λ and the top κ are "
@@ -2923,19 +2792,23 @@ def parse_args():
             "ratio / (ratio + ||J||²) of the signal per map instead of "
             "1 / (1 + ||J||²). Lower prediction errors shrink as ratio**-d, "
             "so keep ratio**d_max well below 1e5 in float32 "
-            "(e.g. ≤ 4 with 9 free maps, ≤ 8 with collapsed pools)."
+            "(e.g. ≤ 4 with 9 free maps, ≤ 8 with collapsed pools). "
+            "Default 4 on a CNN when omitted. Pass multiple values to sweep "
+            "PC only."
         ),
     )
     parser.add_argument(
         "--top_kappa_mult",
         type=float,
-        default=1.0,
+        nargs="+",
+        default=[1.0],
         help=(
             "CNN only: multiply κ of the top hidden map by this factor and "
             "divide that map's activity step by the same factor. λ is left "
             "unchanged. At equilibrium κ e stays tied to the output gradient "
             "while the top displacement Δz shrinks, which is the presynaptic "
-            "shift in the readout and stage-conv updates."
+            "shift in the readout and stage-conv updates. Default 50 on a "
+            "CNN when omitted. Pass multiple values to sweep PC only."
         ),
     )
     parser.add_argument(
@@ -3002,10 +2875,11 @@ def parse_args():
         default="parallel",
         choices=["parallel", "downward"],
         help=(
-            "CNN activity inference. 'parallel' (default) steps every free "
-            "map from the same activities. 'downward' steps one map at a "
-            "time from the top hidden map to the first, and --n_infer_iters "
-            "is the number of those sweeps. MLP training ignores this flag."
+            "CNN activity inference. 'downward' (CNN default) steps one map "
+            "at a time from the top hidden map to the first, and "
+            "--n_infer_iters is the number of those sweeps. 'parallel' steps "
+            "every free map from the same activities. MLP training ignores "
+            "this flag and always uses the parallel jpc update."
         ),
     )
     parser.add_argument(
@@ -3079,16 +2953,22 @@ SWEEP_ALL_KEYS = (
     "param_lr_pc",
     "activity_lr",
     "n_infer_iters",
+    "hidden_kappa_ratio",
+    "top_kappa_mult",
 )
 SWEEP_BP_ONLY = ("param_lr",)
 SWEEP_PC_ONLY = ("param_lr_pc", "activity_lr", "n_infer_iters")
 SWEEP_PC_CLOSED_FORM = ("param_lr_pc",)
+SWEEP_PC_CNN = ("hidden_kappa_ratio", "top_kappa_mult")
 
 
 def pc_only_sweep_keys(args):
     if pc_closed_form(args):
         return SWEEP_PC_CLOSED_FORM
-    return SWEEP_PC_ONLY
+    keys = list(SWEEP_PC_ONLY)
+    if args.arch == "cnn":
+        keys.extend(SWEEP_PC_CNN)
+    return keys
 
 
 def _as_values(args, key):
@@ -3461,22 +3341,18 @@ def _fixed_training_args(args):
             keys.append("additive_depth_factor")
     if uses_conv_pc(args) and getattr(args, "hidden_energy_reduce", "sum") == "spatial_mean":
         keys.append("infer_spatial_lr")
-    if float(getattr(args, "pc_hidden_lr_mult", 1.0)) != 1.0:
-        keys.append("pc_hidden_lr_mult")
-    if float(getattr(args, "pool_activity_lr_mult", 1.0)) != 1.0:
-        keys.append("pool_activity_lr_mult")
     if getattr(args, "adam_kernel_fan_in", False):
         keys.append("adam_kernel_fan_in")
     if pc_delta_enabled(args):
         keys.append("pc_delta_activities")
-    if float(getattr(args, "top_activity_lr_mult", 1.0)) != 1.0:
-        keys.append("top_activity_lr_mult")
-    if getattr(args, "pc_layerwise_norm", False):
-        keys.append("pc_layerwise_norm")
-    if float(getattr(args, "hidden_kappa_ratio", 1.0)) != 1.0:
-        keys.append("hidden_kappa_ratio")
-    if float(getattr(args, "top_kappa_mult", 1.0)) != 1.0:
-        keys.append("top_kappa_mult")
+    for key, neutral in (("hidden_kappa_ratio", 1.0), ("top_kappa_mult", 1.0)):
+        value = getattr(args, key, neutral)
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                continue
+            value = value[0]
+        if float(value) != neutral:
+            keys.append(key)
     fixed = {}
     for key in keys:
         value = getattr(args, key)
@@ -3698,6 +3574,45 @@ def run_scalar_config(args):
     return summary
 
 
+def _cli_has(*options):
+    """True when argv contains one of these flags, including ``--flag=value``."""
+    names = set(options)
+    for arg in sys.argv[1:]:
+        if arg.split("=", 1)[0] in names:
+            return True
+    return False
+
+
+def apply_arch_defaults(args):
+    """Fill omitted flags. A CNN gets the CIFAR-10 recipe; an MLP does not.
+
+    Parser defaults stay the MLP values, because ``--arch`` is resolved
+    after parsing. A flag present on the command line is left alone.
+    """
+    if args.adam_kernel_fan_in is None:
+        args.adam_kernel_fan_in = args.arch == "cnn"
+    if args.arch != "cnn":
+        return
+    if not _cli_has("--activity_update"):
+        args.activity_update = "downward"
+    if not _cli_has("--hidden_kappa_ratio"):
+        args.hidden_kappa_ratio = [4.0]
+    if not _cli_has("--top_kappa_mult"):
+        args.top_kappa_mult = [50.0]
+    if not _cli_has("--n_epochs"):
+        args.n_epochs = 100
+    if not _cli_has("--n_mini_per_epoch"):
+        args.n_mini_per_epoch = 1
+    if not _cli_has("--param_lr"):
+        args.param_lr = [0.3]
+    if not _cli_has("--param_lr_pc"):
+        args.param_lr_pc = [0.3]
+    if not _cli_has("--activity_lr"):
+        args.activity_lr = [0.003]
+    if not _cli_has("--n_infer_iters"):
+        args.n_infer_iters = [20]
+
+
 if __name__ == "__main__":
     args = parse_args()
     args.dataset = normalize_dataset_id(args.dataset)
@@ -3723,6 +3638,7 @@ if __name__ == "__main__":
     if args.arch is None:
         args.arch = default_arch_for_dataset(args.dataset)
         print(f"Using default --arch {args.arch} for {args.dataset}")
+    apply_arch_defaults(args)
     if args.n_seeds < 1:
         raise SystemExit("--n_seeds must be >= 1")
     if args.n_mini_per_epoch < 1:
@@ -3731,17 +3647,13 @@ if __name__ == "__main__":
         raise SystemExit(
             "--activity_update downward is implemented for --arch cnn only."
         )
-    if (
-        args.pc_layerwise_norm
-        or args.hidden_kappa_ratio != 1.0
-        or args.top_kappa_mult != 1.0
-        or args.top_activity_lr_mult != 1.0
-        or args.pool_activity_lr_mult != 1.0
+    if not uses_conv_pc(args) and (
+        any(float(v) != 1.0 for v in _as_values(args, "hidden_kappa_ratio"))
+        or any(float(v) != 1.0 for v in _as_values(args, "top_kappa_mult"))
         or args.adam_kernel_fan_in
-    ) and not uses_conv_pc(args):
+    ):
         raise SystemExit(
-            "--pc_layerwise_norm / --hidden_kappa_ratio / --top_kappa_mult / "
-            "--top_activity_lr_mult / --pool_activity_lr_mult / "
+            "--hidden_kappa_ratio / --top_kappa_mult / "
             "--adam_kernel_fan_in are for --arch cnn."
         )
     args.pc_delta_activities = pc_delta_enabled(args)
@@ -3752,8 +3664,6 @@ if __name__ == "__main__":
             "--pc_delta_activities needs a ReLU --arch cnn without "
             "--collapse_pools."
         )
-    if args.pc_layerwise_norm and args.param_optim not in ("gd", "sgd_momentum"):
-        raise SystemExit("--pc_layerwise_norm needs --param_optim gd or sgd_momentum.")
     if args.skip_pc and args.skip_bp:
         raise SystemExit("Cannot use --skip_pc and --skip_bp together")
     if args.pc_infer_mode == "closed_form":
@@ -3791,22 +3701,15 @@ if __name__ == "__main__":
 # # MLP, Fashion-MNIST
 # python train_benchmark.py --dataset Fashion-MNIST --n_epochs 10 --batch_size 128 --width 256 --n_hidden 2 --param_lr 0.3 --param_lr_pc 0.3 --activity_lr 0.001 --n_infer_iters 20 --param_optim adam --act_fn relu --n_seeds 3 --results_dir results_fashion_mnist
 
-# # CNN, CIFAR-10
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.001 --n_infer_iters 100 --param_optim sgd_momentum --act_fn relu --hidden_energy_reduce spatial_mean --results_dir results_cifar
+# # CNN, CIFAR-10. Omitted flags are the recipe: spatial-mean, downward
+# # sweeps, delta activities, Adam 0.3 with kernel fan-in, κ ratio 4,
+# # top κ ×50, activity step 0.003, 20 sweeps, 100 epochs. Trains PC and BP.
+# python train_benchmark.py --dataset CIFAR10 --arch cnn --results_dir results_cifar --keep_npy
 
-# # CNN, CIFAR-10: fold pools out of the PC graph
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --batch_size 64 --width 512 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.005 --n_infer_iters 100 --param_optim sgd_momentum --act_fn relu --hidden_energy_reduce spatial_mean --collapse_pools --results_dir results_cifar_collapse
-
-
-# # CNN L / κ variants (defaults: --resnet_fwd_l n_res_blocks, --resnet_energy_l n_weight_layers, --hidden_energy_layers weight)
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers weight --results_dir results_cifar_l_default
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --resnet_fwd_l n_weight_layers --resnet_energy_l n_weight_layers --hidden_energy_layers all --results_dir results_cifar_l_old
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --resnet_fwd_l n_res_blocks --resnet_energy_l n_modules --hidden_energy_layers all --results_dir results_cifar_l_modules
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --resnet_fwd_l n_res_blocks --resnet_energy_l n_weight_layers --hidden_energy_layers residual --results_dir results_cifar_l_res
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --additive_depth_factor 4 --results_dir results_cifar_l_energy_r_plus_4
-
-# # CNN, ImageNet (HF streaming) - Not optimised
-# python train_benchmark.py --dataset ImageNet --arch cnn --n_epochs 100 --batch_size 64 --width 256 --n_res_blocks 3 --param_lr 0.1 --param_lr_pc 0.1 --activity_lr 0.01 --n_infer_iters 20 --param_optim sgd_momentum --act_fn relu --results_dir results_imagenet
+# # CNN, CIFAR-10: sweep the two κ knobs. One BP run, then each PC pair.
+# python train_benchmark.py --dataset CIFAR10 --arch cnn \
+#   --hidden_kappa_ratio 2 4 --top_kappa_mult 20 50 \
+#   --results_dir results_cifar_kappa_sweep --keep_npy
 
 
 ########### SWEEP (MNIST) ##############
@@ -3848,18 +3751,5 @@ if __name__ == "__main__":
 #   --results_dir results_mnist_sweep_fine_bs128
 # #   --results_dir results_fashion_mnist_sweep_fine_bs128
 
-
-########### SWEEP (CIFAR) ##############
-########################################
-
-# # CNN, CIFAR-10: Hyperparameter sweep including residual-block depth (Can start lr at 0.03, probably 0.1 best)
-# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --n_seeds 1 \
-#   --width 256 --n_res_blocks 3 --batch_size 64 \
-#   --param_lr 0.001 0.003 0.01 0.03 0.1 0.3 1.0 \
-#   --param_lr_pc 0.01 0.03 0.1 0.3 1.0 3.0 \
-#   --activity_lr 0.01 0.03 0.1 0.3 \
-#   --n_infer_iters 20 200 \
-#   --param_optim sgd_momentum --act_fn relu \
-#   --results_dir results_cifar_sweep
 
 

@@ -8,8 +8,7 @@ From ``experiments/dmft``:
 
     JAX_ENABLE_X64=1 python src/diag.py check --width 32
 
-    python src/diag.py blowup --param_optim adam --param_lr 0.3 --param_lr_pc 0.3 \
-        --collapse_pools --activity_update downward --n_infer_iters 4 --activity_lr 0.02
+    python src/diag.py blowup --steps 50 --every 10
 
 ``check`` compares ``pc_energy_fn`` with and without delta activities. With
 ``JAX_ENABLE_X64=1`` the two must agree in value, activity gradient, and weight
@@ -45,15 +44,14 @@ from src import cnn_pc  # noqa: E402
 def parse():
     defaults = [
         "--dataset", "CIFAR10", "--arch", "cnn", "--width", "128",
-        "--n_res_blocks", "3", "--batch_size", "64",
-        "--param_optim", "sgd_momentum", "--act_fn", "relu",
-        "--hidden_energy_reduce", "spatial_mean",
-        "--activity_lr", "0.05", "--param_lr", "0.01",
+        "--n_res_blocks", "3", "--batch_size", "64", "--act_fn", "relu",
     ]
     # Defaults first so a flag on the command line overrides them.
+    # Omitted CNN flags then take the CIFAR-10 recipe.
     sys.argv = [sys.argv[0]] + defaults + sys.argv[1:]
     args = tb.parse_args()
     args.dataset = tb.normalize_dataset_id(args.dataset)
+    tb.apply_arch_defaults(args)
     tb._scalarize_sweep_fields(args)
     return args
 
@@ -170,13 +168,6 @@ def blowup():
             gain = getattr(args, "_kappa_depth_gain", None)
             if gain is not None:
                 s = s / jnp.append(gain, 1.0)
-            m = float(getattr(args, "top_activity_lr_mult", 1.0))
-            s = s.at[len(acts) - 2].multiply(m)
-            pm = float(getattr(args, "pool_activity_lr_mult", 1.0))
-            if not collapse and pm != 1.0:
-                for i, layer in enumerate(model.layers[: len(acts) - 1]):
-                    if not jax.tree_util.tree_leaves(eqx.filter(layer, eqx.is_array)):
-                        s = s.at[i].multiply(pm)
             step_scales = s
         B = x.shape[0]
         grad_fn = jax.grad(lambda a: B * cnn_pc.pc_energy_fn(
