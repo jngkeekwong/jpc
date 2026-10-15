@@ -197,6 +197,19 @@ FIGURES = [
         "pc_bp_epoch_metrics_mean_sem.pdf",
         "supfig8b",
     ),
+    (
+        "results/results_benchmark/results_cifar/CIFAR10/cnn/ce/"
+        "128_width/3_n_res_blocks/relu_act_fn/mupc_param_type/1.0_gamma/"
+        "adam_param_optim/0.3_param_lr/0.3_param_lr_pc/64_batch_size/"
+        "100_n_epochs/20_n_infer_iters/0.003_activity_lr/False_use_skips/"
+        "n_res_blocks_resnet_fwd_l/n_weight_layers_resnet_energy_l/"
+        "weight_hidden_energy_layers/False_collapse_pools/"
+        "spatial_mean_hidden_energy_reduce/True_infer_spatial_lr/"
+        "downward_activity_update/adam_kernel_fan_in/pc_delta_activities/"
+        "4.0_hidden_kappa_ratio/50.0_top_kappa_mult/False_skip_pc/"
+        "False_skip_bp/seeds_0_2/plots/pc_bp_epoch_metrics_mean_sem.pdf",
+        "supfig8c",
+    ),
 ]
 
 

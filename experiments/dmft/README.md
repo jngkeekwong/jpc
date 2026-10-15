@@ -52,3 +52,4 @@ The nonlinear gamma and width runs are slow on a GPU other than an H100. The ali
 | Fig. 3d–i, Sup. Figs. 4–7 | Alignment: iterative inference (`--n_seeds 3`) | `results_alignment` |
 | Sup. Fig. 8a | Benchmarking: MLP, MNIST | `results_mnist` |
 | Sup. Fig. 8b | Benchmarking: MLP, Fashion-MNIST | `results_fashion_mnist` |
+| Sup. Fig. 8c | Benchmarking: CNN, CIFAR-10 | `results_cifar` |

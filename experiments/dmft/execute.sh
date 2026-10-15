@@ -123,9 +123,14 @@ python() {
 # # MLP, Fashion-MNIST
 # python train_benchmark.py --dataset Fashion-MNIST --n_epochs 10 --batch_size 128 --width 256 --n_hidden 2 --param_lr 0.3 --param_lr_pc 0.3 --activity_lr 0.001 --n_infer_iters 20 --param_optim adam --act_fn relu --n_seeds 3 --results_dir results_fashion_mnist --keep_npy
 
-# CNN, CIFAR-10
+# # CNN, CIFAR-10
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --n_mini_per_epoch 1 --batch_size 64 --width 128 --n_res_blocks 3 --n_seeds 3 --results_dir results_cifar --keep_npy \
 #   --hidden_energy_reduce spatial_mean --infer_spatial_lr --activity_update downward --pc_delta_activities --hidden_kappa_ratio 4 --top_kappa_mult 50 \
+#   --param_lr 0.3 --param_lr_pc 0.3 --activity_lr 0.003 --n_infer_iters 20 --act_fn relu --param_optim adam --adam_kernel_fan_in
+
+# # CNN, CIFAR-10 (Test)
+# python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --n_mini_per_epoch 1 --batch_size 64 --width 128 --n_res_blocks 3 --n_seeds 3 --results_dir results_cifar_modules --keep_npy \
+#   --hidden_energy_reduce spatial_mean --infer_spatial_lr --activity_update downward --pc_delta_activities --hidden_kappa_ratio 4 --top_kappa_mult 50 --resnet_energy_l n_modules \
 #   --param_lr 0.3 --param_lr_pc 0.3 --activity_lr 0.003 --n_infer_iters 20 --act_fn relu --param_optim adam --adam_kernel_fan_in
 
 
@@ -172,7 +177,7 @@ python() {
 ############ SWEEP (CIFAR-10) #############
 ###########################################
 
-# CNN, CIFAR-10: Hyperparameter sweep (Coarse)
+# # CNN, CIFAR-10: Hyperparameter sweep (Coarse)
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 10 --n_mini_per_epoch 1 --n_seeds 1 \
 #   --width 128 --n_res_blocks 3 --batch_size 64 --param_optim adam --adam_kernel_fan_in --act_fn relu \
 #   --hidden_energy_reduce spatial_mean --infer_spatial_lr --activity_update downward --pc_delta_activities \
@@ -184,7 +189,7 @@ python() {
 #   --top_kappa_mult 10 20 50 100 200 \
 #   --results_dir results_cifar_sweep_coarse
 
-# CNN, CIFAR-10: Hyperparameter sweep (Fine)
+# # CNN, CIFAR-10: Hyperparameter sweep (Fine)
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --n_mini_per_epoch 1 --n_seeds 2 \
 #   --width 128 --n_res_blocks 3 --batch_size 64 --param_optim adam --adam_kernel_fan_in --act_fn relu \
 #   --hidden_energy_reduce spatial_mean --infer_spatial_lr --activity_update downward --pc_delta_activities \
@@ -196,7 +201,7 @@ python() {
 #   --top_kappa_mult 20 50 \
 #   --results_dir results_cifar_sweep_fine
 
-# CNN, CIFAR-10: Hyperparameter sweep (Final)
+# # CNN, CIFAR-10: Hyperparameter sweep (Final)
 # python train_benchmark.py --dataset CIFAR10 --arch cnn --n_epochs 100 --n_mini_per_epoch 1 --n_seeds 3 \
 #   --width 128 --n_res_blocks 3 --batch_size 64 --param_optim adam --adam_kernel_fan_in --act_fn relu \
 #   --hidden_energy_reduce spatial_mean --infer_spatial_lr --activity_update downward --pc_delta_activities \

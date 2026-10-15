@@ -101,8 +101,10 @@ _AL_SEEDS = 3
 _AL_N_LOSS = 200  # max(11, round(1001 / 5))
 _AL_HEATMAP = (0, 100, 199)
 
-# execute.sh: classification benchmarks.
+# execute.sh: classification benchmarks. MLP runs use 10 epochs;
+# the CIFAR-10 CNN uses 100, which also shrinks the epoch markers.
 _BENCH_EPOCHS = 10
+_BENCH_CIFAR_EPOCHS = 100
 _BENCH_SEEDS = 3
 
 _KERNEL_GRID_KW = dict(cbar=False, center_zero=False)
@@ -697,7 +699,7 @@ def _plot_alignment(work, *, include_loss_matched=False):
     }
 
 
-# --- Benchmark (supfig8, figX13) ------------------------------------------
+# --- Benchmark (supfig8a–c, figX13) ---------------------------------------
 
 
 def _synthetic_benchmark_history(
@@ -757,9 +759,10 @@ def _synthetic_benchmark_history(
 def _plot_benchmarks(work, *, include_single=False):
     from train_benchmark import plot_metrics, plot_metrics_mean_sem
 
-    def histories(seed0, acc_end, loss_floor):
+    def histories(seed0, acc_end, loss_floor, n_epochs=_BENCH_EPOCHS):
         return [
             _synthetic_benchmark_history(
+                n_epochs=n_epochs,
                 seed=seed0 + s,
                 pc_offset=0.15 * s,
                 acc_end=acc_end,
@@ -770,11 +773,21 @@ def _plot_benchmarks(work, *, include_single=False):
 
     mnist_dir = work / "mnist"
     fashion_dir = work / "fashion"
+    cifar_dir = work / "cifar"
     mnist_mean = plot_metrics_mean_sem(
         histories(0, acc_end=97.0, loss_floor=0.08), str(mnist_dir)
     )[0]
     fashion_mean = plot_metrics_mean_sem(
         histories(10, acc_end=90.0, loss_floor=0.15), str(fashion_dir)
+    )[0]
+    cifar_mean = plot_metrics_mean_sem(
+        histories(
+            20,
+            acc_end=78.0,
+            loss_floor=0.55,
+            n_epochs=_BENCH_CIFAR_EPOCHS,
+        ),
+        str(cifar_dir),
     )[0]
     mnist_single = None
     if include_single:
@@ -784,7 +797,7 @@ def _plot_benchmarks(work, *, include_single=False):
             ),
             str(mnist_dir / "single"),
         )[0]
-    return mnist_mean, fashion_mean, mnist_single
+    return mnist_mean, fashion_mean, cifar_mean, mnist_single
 
 
 def main():
@@ -1001,11 +1014,12 @@ def main():
                 update_mode="infer",
             )
 
-        mnist, fashion, single = _plot_benchmarks(
+        mnist, fashion, cifar, single = _plot_benchmarks(
             work, include_single=args.extras
         )
         paper["supfig8a"] = mnist
         paper["supfig8b"] = fashion
+        paper["supfig8c"] = cifar
         if args.extras:
             extras["figX13"] = single
 
